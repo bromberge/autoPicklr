@@ -4,13 +4,16 @@ modules = ["python-3.11"]
 channel = "stable-25_05"
 packages = ["openssl", "postgresql"]
 
+# Replit Autoscale uses this section when deploying
 [deployment]
 deploymentTarget = "autoscale"
-run = ["gunicorn", "--bind", "0.0.0.0:5000", "main:app"]
+# IMPORTANT: use uvicorn (ASGI), not plain gunicorn
+run = ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
 
 [workflows]
 runButton = "Project"
 
+# Click "Run" starts these tasks; we also use uvicorn here
 [[workflows.workflow]]
 name = "Project"
 mode = "parallel"
@@ -30,8 +33,9 @@ author = "agent"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "gunicorn --bind 0.0.0.0:5000 --reuse-port --reload main:app"
-waitForPort = 5000
+# IMPORTANT: uvicorn, not gunicorn
+args = "uvicorn main:app --host 0.0.0.0 --port 8080"
+waitForPort = 8080
 
 [[workflows.workflow]]
 name = "install_dependencies"
@@ -39,15 +43,10 @@ author = "agent"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "uv add fastapi uvicorn sqlmodel httpx"
+# Add your deps here. 'uvicorn[standard]' pulls in useful extras.
+args = "uv add fastapi 'uvicorn[standard]' sqlmodel httpx jinja2"
 
-[[ports]]
-localPort = 5000
-externalPort = 80
-
+# Ports Replit exposes; we run on 8080
 [[ports]]
 localPort = 8080
 externalPort = 8080
-
-[agent]
-integrations = ["styling_replit==1.0.0"]

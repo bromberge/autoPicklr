@@ -22,3 +22,8 @@ DET_EMA_LONG = int(env("DET_EMA_LONG", int, 26))
 HISTORY_MINUTES = int(env("HISTORY_MINUTES", int, 600))
 TELEGRAM_BOT_TOKEN = env("TELEGRAM_BOT_TOKEN", str, "")
 TELEGRAM_CHAT_ID = env("TELEGRAM_CHAT_ID", str, "")
+
+POLL_SECONDS = 10
+UNIVERSE = ["BTC", "ETH", "SOL"]
+
+USE_COINGECKO = True  # set True to use CG, False to use mock
