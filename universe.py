@@ -220,7 +220,7 @@ async def refresh_universe(session: Session) -> List[UniversePair]:
             usd_vol_24h=usd_vol24,  # for USDT this is ~USD
             updated_at=now,
         ))
-        print(f"[universe] Passed volume filter (min ${MIN_VOLUME_USD:,.0f}): {len(rows)}")  # <-- move here
+        print(f"[universe] Passed volume filter (min ${MIN_VOLUME_USD:,.0f}): {len(rows)}")
 
     # 3) Rank & cap
     rows.sort(key=lambda r: r.usd_vol_24h, reverse=True)
