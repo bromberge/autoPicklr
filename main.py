@@ -26,13 +26,18 @@ engine = create_engine("sqlite:///picklr.db",
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
+    print("[startup] Creating database tables...")
     SQLModel.metadata.create_all(engine)
+    print("[startup] Ensuring wallet exists...")
     with Session(engine) as s:
         ensure_wallet(s)
+    print("[startup] Starting trading loop...")
     # Start trading loop
     asyncio.create_task(trading_loop())
+    print("[startup] Startup complete!")
     yield
     # Shutdown (nothing needed for now)
+    print("[shutdown] Server shutting down...")
 
 app = FastAPI(title="autoPicklr Trading Simulator", lifespan=lifespan)
 
@@ -149,13 +154,19 @@ def admin_reset():
 
 
 async def trading_loop():
+    print("[loop] Starting trading loop...")
     await asyncio.sleep(2)  # small delay so app has booted
+    print("[loop] Initial delay complete, entering main loop")
     while True:
         try:
             if RUN_ENABLED:
+                print("[loop] Processing trading cycle...")
                 with Session(engine) as s:
+                    print("[loop] Updating candles...")
                     await update_candles(s)
+                    print("[loop] Managing positions...")
                     mark_to_market_and_manage(s)
+                    print("[loop] Checking for new positions...")
                     if can_open_new_position(s):
                         for sym in UNIVERSE:
                             sigs = compute_signals(s, sym)
@@ -166,13 +177,17 @@ async def trading_loop():
                                 else:
                                     qty = 0
                                 if qty > 0:
+                                    print(f"[loop] Placing buy order for {sym}")
                                     place_buy(s, sym, qty, sig.entry,
                                               sig.reason)
                                     break  # one new entry per cycle
+                    print(f"[loop] Cycle complete, sleeping for {POLL_SECONDS}s")
             else:
                 print("[loop] paused")
         except Exception as e:
             print(f"[loop] error: {e}")
+            import traceback
+            traceback.print_exc()
         await asyncio.sleep(POLL_SECONDS)
 
 
