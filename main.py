@@ -374,3 +374,67 @@ def admin_next_signals():
         "signals": out
     }
 
+# --- Debug helpers to see candles live ---
+
+@app.post("/admin/tick_many")
+async def tick_many(n: int = 5, delay_ms: int = 1000):
+    """Run update_candles() n times with a short delay. Helps you accumulate fresh minutes."""
+    for _ in range(n):
+        with Session(engine) as s:
+            await update_candles(s)
+        await asyncio.sleep(delay_ms / 1000)
+    return {"ok": True, "ran": n}
+
+@app.get("/admin/candles_summary")
+def candles_summary():
+    """Show per-symbol count and latest candle info."""
+    out = []
+    with Session(engine) as s:
+        for sym in UNIVERSE:
+            last = s.exec(
+                select(Candle).where(Candle.symbol == sym).order_by(desc(Candle.ts))
+            ).first()
+            cnt = s.exec(select(Candle).where(Candle.symbol == sym)).all()
+            out.append({
+                "symbol": sym,
+                "count": len(cnt),
+                "latest_ts": last.ts.isoformat() if last else None,
+                "latest_close": last.close if last else None,
+            })
+    return out
+
+@app.get("/admin/last_candle/{symbol}")
+def last_candle(symbol: str):
+    symbol = symbol.upper()
+    with Session(engine) as s:
+        c = s.exec(
+            select(Candle).where(Candle.symbol == symbol).order_by(desc(Candle.ts))
+        ).first()
+        if not c:
+            return {"symbol": symbol, "found": False}
+        return {
+            "symbol": symbol,
+            "found": True,
+            "ts": c.ts.isoformat(),
+            "open": c.open, "high": c.high, "low": c.low, "close": c.close, "volume": c.volume
+        }
+
+# --- Live-data diagnostics ---
+
+from data import cg_simple_prices, last_n_candles  # add near your other imports
+
+@app.get("/admin/cg_simple")
+async def cg_simple():
+    """Spot prices straight from CoinGecko right now (no DB)."""
+    prices = await cg_simple_prices(UNIVERSE)
+    return {"source": "coingecko", "prices_usd": prices}
+
+@app.get("/admin/last5/{symbol}")
+def last5(symbol: str):
+    """Last 5 stored candles for a symbol (what the engine really sees)."""
+    symbol = symbol.upper()
+    with Session(engine) as s:
+        rows = last_n_candles(s, symbol, n=5)
+    return {"symbol": symbol, "rows": rows}
+
+

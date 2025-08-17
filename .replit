@@ -8,6 +8,10 @@ channel = "stable-25_05"
 localPort = 5000
 externalPort = 80
 
+[[ports]]
+localPort = 8080
+externalPort = 8080
+
 [workflows]
 runButton = "Project"
 
@@ -18,10 +22,10 @@ author = "agent"
 
 [[workflows.workflow.tasks]]
 task = "workflow.run"
-args = "server"
+args = "main"
 
 [[workflows.workflow]]
-name = "server"
+name = "main"
 author = "agent"
 
 [[workflows.workflow.tasks]]
