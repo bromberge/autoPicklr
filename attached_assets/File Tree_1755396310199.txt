@@ -1,0 +1,10 @@
+# autoPicklr/ File Tree
+  main.py                # FastAPI app + background loop
+  models.py              # SQLModel tables (wallet, orders, positions, trades, candles)
+  data.py                # CoinGecko polling + caching
+  signal_engine.py       # Simple rules (EMA breakout + volume + chooser_threshold)
+  sim.py                 # Order simulator (next-bar fills, fees, slippage)
+  risk.py                # Sizing, risk caps, portfolio limits
+  settings.py            # Config from .env (universe, fees, poll interval)
+  requirements.txt
+  .env.example
