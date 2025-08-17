@@ -1,6 +1,6 @@
-#models.py
+# models.py
 
-from typing import Optional, List
+from typing import Optional
 from datetime import datetime
 from sqlmodel import SQLModel, Field
 
@@ -52,6 +52,13 @@ class Position(SQLModel, table=True):
     target: float
     status: str  # OPEN/CLOSED
 
+    # --- Exit management state ---
+    tp1_done: bool = False
+    tp2_done: bool = False
+    be_moved: bool = False           # stop moved to breakeven?
+    tsl_active: bool = False         # trailing stop running?
+    tsl_high: Optional[float] = None # highest price since TSL activated
+
 class Trade(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     symbol: str
@@ -61,4 +68,4 @@ class Trade(SQLModel, table=True):
     exit_px: Optional[float] = None
     qty: float
     pnl_usd: Optional[float] = None
-    result: Optional[str] = None  # WIN/LOSS/TIMEOUT
+    result: Optional[str] = None  # WIN/LOSS/FLAT/TIME

@@ -7,6 +7,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlmodel import SQLModel, create_engine, Session, select
+from sqlalchemy import text
 
 from models import *
 from data import update_candles
@@ -63,11 +64,29 @@ async def admin_tick():
                         w = s.get(Wallet, 1)
                         qty = size_position(w.balance_usd, sig.entry, sig.stop)
                         if qty > 0:
-                            place_buy(s, sym, qty, sig.entry, sig.reason)
+                            place_buy(s, sym, qty, sig.entry, sig.reason, sig.stop, sig.target)
                             break  # one new entry per cycle
         return {"ok": True}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+@app.get("/admin/diag")
+def admin_diag():
+    with Session(engine) as s:
+        w = s.get(Wallet, 1)
+        cash = w.balance_usd if w else None
+        # peek at last order for context
+        last_order = s.exec(select(Order).order_by(Order.id.desc())).first()
+        return {
+            "cash": cash,
+            "last_order": {
+                "symbol": last_order.symbol,
+                "side": last_order.side,
+                "qty": last_order.qty,
+                "price_fill": last_order.price_fill,
+                "note": last_order.reason
+            } if last_order else None
+        }
 
 
 # Static + templates
@@ -90,16 +109,18 @@ def create_db_and_wallet():
 
 @app.post("/admin/reset")
 def admin_reset():
-    """Close all positions, clear orders/trades, reset wallet to $1000. Keeps candles."""
+    """Hard reset: close positions, clear orders/trades, reset wallet to $1000. Keeps candles."""
     with Session(engine) as s:
-        # Close positions
+        # Close all open positions
         opens = s.exec(select(Position).where(Position.status == "OPEN")).all()
         for p in opens:
             p.status = "CLOSED"
-        # Clear orders & trades
-        s.exec(text("DELETE FROM 'order'")
-               )  # table name is order; quoted because it's a keyword
+
+        # Clear orders & trades (use raw SQL because 'order' is a reserved word)
+        s.exec(text('DELETE FROM "order"'))
         s.exec(text("DELETE FROM trade"))
+        s.commit()
+
         # Reset wallet
         w = s.get(Wallet, 1)
         if w:
@@ -107,13 +128,11 @@ def admin_reset():
             w.equity_usd = 1000.0
             w.updated_at = datetime.utcnow()
         else:
-            s.add(
-                Wallet(id=1,
-                       balance_usd=1000.0,
-                       equity_usd=1000.0,
-                       updated_at=datetime.utcnow()))
+            s.add(Wallet(id=1, balance_usd=1000.0, equity_usd=1000.0, updated_at=datetime.utcnow()))
         s.commit()
+
     return {"ok": True}
+
 
 
 async def trading_loop():
@@ -286,6 +305,41 @@ def performance():
             "current_equity": round(running_total, 2)
         }
 
+from signal_engine import compute_signals
+from settings import ENABLE_DEBUG_SIGNALS, DET_EMA_SHORT, DET_EMA_LONG, MIN_BREAKOUT_PCT, MIN_VOLUME_USD, CHOOSER_THRESHOLD, BREAKOUT_LOOKBACK, STOP_PCT, TARGET_PCT
 
-# No second __main__ block — run with uvicorn/gunicorn command
-# My name is Jeff
+@app.get("/admin/next_signals")
+def admin_next_signals():
+    """Preview the next signals per symbol using the CURRENT strategy settings."""
+    out = []
+    with Session(engine) as s:
+        for sym in UNIVERSE:
+            sigs = compute_signals(s, sym)
+            # return top signal (or empty)
+            if sigs:
+                sig = sigs[0]
+                out.append({
+                    "symbol": sym,
+                    "score": sig.score,
+                    "entry": round(sig.entry, 6),
+                    "stop": round(sig.stop, 6),
+                    "target": round(sig.target, 6),
+                    "reason": sig.reason
+                })
+            else:
+                out.append({"symbol": sym, "signal": None})
+    return {
+        "debug_mode": ENABLE_DEBUG_SIGNALS,
+        "rules": {
+            "ema_short": DET_EMA_SHORT,
+            "ema_long": DET_EMA_LONG,
+            "breakout_lookback": BREAKOUT_LOOKBACK,
+            "min_breakout_pct": MIN_BREAKOUT_PCT,
+            "min_volume_usd": MIN_VOLUME_USD,
+            "chooser_threshold": CHOOSER_THRESHOLD,
+            "stop_pct": STOP_PCT,
+            "target_pct": TARGET_PCT,
+        },
+        "signals": out
+    }
+
