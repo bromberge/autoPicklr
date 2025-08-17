@@ -23,6 +23,14 @@ app = FastAPI(title="autoPicklr Trading Simulator")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
+@app.get("/ping")
+def ping():
+    return {"message": "pong"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8080)
+    
 @app.on_event("startup")
 def startup():
     SQLModel.metadata.create_all(engine)
