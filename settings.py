@@ -92,4 +92,10 @@ ALLOWED_QUOTES = [s.strip().upper() for s in env("ALLOWED_QUOTES", str, "USD,USD
 # Lower the 24h USD-volume threshold (Kraken’s USD markets are thinner than Binance’s)
 MIN_VOLUME_USD = float(env("MIN_VOLUME_USD", float, 1_000_000))
 
+# Trade selection knobs
+MAX_NEW_POSITIONS_PER_CYCLE = int(env("MAX_NEW_POSITIONS_PER_CYCLE", int, 1))
+SIGNAL_MIN_NOTIONAL_USD = float(env("SIGNAL_MIN_NOTIONAL_USD", float, 25.0))
+
+# How often to rebuild the symbol list from Kraken
+UNIVERSE_REFRESH_MINUTES = int(env("UNIVERSE_REFRESH_MINUTES", int, 15))
 

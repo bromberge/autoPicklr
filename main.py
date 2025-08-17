@@ -2,7 +2,9 @@
 
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone, timedelta  # if not already present
+from settings import UNIVERSE_REFRESH_MINUTES
+
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -21,6 +23,14 @@ from sim import (
     size_position,
     place_buy,
     mark_to_market_and_manage,
+)
+
+from settings import (
+    MAX_OPEN_POSITIONS,
+    MAX_NEW_POSITIONS_PER_CYCLE,
+    SIGNAL_MIN_NOTIONAL_USD,
+    FEE_PCT,
+    SLIPPAGE_PCT,
 )
 
 # dynamic universe + candles
@@ -68,6 +78,69 @@ templates = Jinja2Templates(directory="templates")
 
 
 # ---- Routes ----
+from fastapi import APIRouter
+admin = APIRouter()
+
+@admin.get("/admin/next_signals")
+def admin_next_signals():
+    with Session(engine) as s:
+        out = []
+        w = s.get(Wallet, 1)
+        if not w:
+            return {"debug_mode": False, "candidates": [], "note": "no wallet"}
+        for sym in UNIVERSE:
+            sigs = compute_signals(s, sym)
+            if not sigs:
+                out.append({"symbol": sym, "signal": None})
+                continue
+            sig = max(sigs, key=lambda x: getattr(x, "score", 0.0))
+            qty_est = size_position(w.balance_usd, sig.entry, sig.stop)
+            est_fill = sig.entry * (1 + SLIPPAGE_PCT)
+            unit_cost = est_fill * (1 + FEE_PCT)
+            notional_est = qty_est * unit_cost if qty_est > 0 else 0.0
+            out.append({
+                "symbol": sym,
+                "signal": {
+                    "score": getattr(sig, "score", 0.0),
+                    "entry": sig.entry,
+                    "stop": sig.stop,
+                    "target": sig.target,
+                    "reason": sig.reason,
+                    "qty_est": qty_est,
+                    "notional_est": round(notional_est, 2),
+                    "passes_min_notional": notional_est >= SIGNAL_MIN_NOTIONAL_USD
+                }
+            })
+        # sort like the loop
+        out_sorted = sorted(
+            [o for o in out if o["signal"]],
+            key=lambda o: o["signal"]["score"],
+            reverse=True
+        )
+        return {"candidates_sorted": out_sorted[:10]}  # show top 10 for readability
+
+app.include_router(admin)
+
+# --- Admin: view current universe (symbols in DB) ---
+@app.get("/admin/universe")
+def admin_universe():
+    from universe import UniversePair
+    with Session(engine) as s:
+        rows = s.exec(select(UniversePair).order_by(UniversePair.usd_vol_24h.desc())).all()
+        return {
+            "count": len(rows),
+            "symbols": [r.symbol for r in rows],
+        }
+
+# --- Admin: force refresh from Kraken (manual) ---
+@app.post("/admin/universe_refresh")
+async def admin_universe_refresh():
+    from universe import refresh_universe
+    with Session(engine) as s:
+        rows = await refresh_universe(s)
+        return {"ok": True, "count": len(rows)}
+
+
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
     return templates.TemplateResponse("dashboard.html", {"request": request})
@@ -137,8 +210,9 @@ def orders():
 def positions():
     with Session(engine) as s:
         xs = s.exec(select(Position).where(Position.status == "OPEN")).all()
-        return [
-            {
+        out = []
+        for x in xs:
+            out.append({
                 "id": x.id,
                 "symbol": x.symbol,
                 "qty": x.qty,
@@ -146,9 +220,28 @@ def positions():
                 "opened_ts": x.opened_ts.isoformat(),
                 "stop": x.stop,
                 "target": x.target,
-                "status": x.status
-            } for x in xs
-        ]
+                "status": x.status,
+                # profit-protection flags
+                "tp1_done": getattr(x, "tp1_done", False),
+                "tp2_done": getattr(x, "tp2_done", False),
+                "be_moved": getattr(x, "be_moved", False),
+                "tsl_active": getattr(x, "tsl_active", False),
+                "tsl_high": getattr(x, "tsl_high", None),
+            })
+        return out
+
+@app.get("/api/pp_summary")
+def profit_protection_summary():
+    with Session(engine) as s:
+        xs = s.exec(select(Position).where(Position.status == "OPEN")).all()
+        return {
+            "open_positions": len(xs),
+            "tp1_done": sum(1 for p in xs if getattr(p, "tp1_done", False)),
+            "tp2_done": sum(1 for p in xs if getattr(p, "tp2_done", False)),
+            "be_moved": sum(1 for p in xs if getattr(p, "be_moved", False)),
+            "tsl_active": sum(1 for p in xs if getattr(p, "tsl_active", False)),
+        }
+
 
 @app.get("/api/trades")
 def trades():
@@ -196,7 +289,10 @@ def performance():
 
 
 # -------- trading loop --------
+LAST_UNIVERSE_REFRESH = None
+
 async def trading_loop():
+    global LAST_UNIVERSE_REFRESH
     print("[loop] Starting trading loop...")
     await asyncio.sleep(2)
     print("[loop] Initial delay complete, entering main loop")
@@ -205,17 +301,21 @@ async def trading_loop():
             if RUN_ENABLED:
                 print("[loop] Processing trading cycle...")
                 with Session(engine) as s:
-                    # 0) Refresh universe if stale (age > UNIVERSE_CACHE_MINUTES or empty)
-                    if universe_stale(s):
-                        print("[loop] Universe is stale — refreshing…")
-                        await refresh_universe(s)
+
+                    # --- scheduled universe refresh (only one strategy) ---
+                    now = datetime.utcnow()
+                    if (
+                        LAST_UNIVERSE_REFRESH is None
+                        or (now - LAST_UNIVERSE_REFRESH) >= timedelta(minutes=UNIVERSE_REFRESH_MINUTES)
+                    ):
+                        print("[loop] Universe cache empty/stale — refreshing…")
+                        rows = await refresh_universe(s)  # reuse current session
+                        print(f"[universe] Refreshed {len(rows)} USD/USDT pairs from Kraken.")
+                        LAST_UNIVERSE_REFRESH = now
+                    # --- end universe refresh ---
 
                     # 1) Get active symbols from cache; fallback to static if needed
                     active_syms = get_active_universe(s)
-                    if not active_syms:
-                        print("[loop] Universe cache empty — refreshing…")
-                        await refresh_universe(s)
-                        active_syms = get_active_universe(s)
                     if not active_syms:
                         active_syms = UNIVERSE  # last-resort fallback
                     print(f"[loop] Active symbols: {active_syms}")
@@ -228,19 +328,69 @@ async def trading_loop():
                     print("[loop] Managing positions...")
                     mark_to_market_and_manage(s)
 
-                    # 4) Look for new entries (at most one per cycle)
+                    # 4) Look for new entries (ranked; place at most N per cycle)
                     print("[loop] Checking for new positions...")
-                    if can_open_new_position(s):
-                        for sym in active_syms:
-                            sigs = compute_signals(s, sym)
-                            for sig in sigs:
-                                w = s.get(Wallet, 1)
-                                cash = w.balance_usd if w else 0.0
-                                qty = size_position(cash, sig.entry, sig.stop)
-                                if qty > 0:
-                                    print(f"[loop] Placing buy order for {sym}")
-                                    place_buy(s, sym, qty, sig.entry, sig.reason, sig.stop, sig.target)
-                                    break  # one new entry per cycle
+
+                    from settings import (
+                        MAX_NEW_POSITIONS_PER_CYCLE,
+                        SIGNAL_MIN_NOTIONAL_USD,
+                        FEE_PCT,
+                        SLIPPAGE_PCT,
+                        MAX_OPEN_POSITIONS
+                    )
+                    from risk import size_position  # make sure this is also a top-level import
+
+                    candidates = []
+                    w = s.get(Wallet, 1)
+                    if w is not None:
+                        open_count = len(s.exec(select(Position).where(Position.status == "OPEN")).all())
+                        slots_left = max(0, MAX_OPEN_POSITIONS - open_count)
+
+                        if slots_left > 0:
+                            # IMPORTANT: iterate over dynamic active_syms, not UNIVERSE
+                            for sym in active_syms:
+                                sigs = compute_signals(s, sym)
+                                if not sigs:
+                                    continue
+
+                                # take best signal (by score)
+                                sig = max(sigs, key=lambda x: getattr(x, "score", 0.0))
+
+                                # estimate qty/notional before any order
+                                qty_est = size_position(w.balance_usd, sig.entry, sig.stop)
+                                if qty_est <= 0:
+                                    continue
+
+                                est_fill = sig.entry * (1 + SLIPPAGE_PCT)
+                                unit_cost = est_fill * (1 + FEE_PCT)
+                                notional_est = qty_est * unit_cost
+
+                                if notional_est < SIGNAL_MIN_NOTIONAL_USD:
+                                    continue
+
+                                candidates.append((sym, sig, qty_est, notional_est))
+
+                    # sort by score desc and place up to N
+                    if candidates and slots_left > 0:
+                        candidates.sort(key=lambda t: getattr(t[1], "score", 0.0), reverse=True)
+
+                        placed = 0
+                        for sym, sig, qty_est, _ in candidates:
+                            if placed >= min(MAX_NEW_POSITIONS_PER_CYCLE, slots_left):
+                                break
+                            # re-check wallet just in case
+                            w = s.get(Wallet, 1)
+                            if w is None:
+                                break
+
+                            qty = size_position(w.balance_usd, sig.entry, sig.stop)
+                            if qty <= 0:
+                                continue
+
+                            print(f"[loop] Placing buy order for {sym} (score={getattr(sig,'score',0.0):.2f})")
+                            place_buy(s, sym, qty, sig.entry, sig.reason)
+                            placed += 1
+
                     print(f"[loop] Cycle complete, sleeping for {POLL_SECONDS}s")
             else:
                 print("[loop] paused")
@@ -249,3 +399,4 @@ async def trading_loop():
             import traceback
             traceback.print_exc()
         await asyncio.sleep(POLL_SECONDS)
+

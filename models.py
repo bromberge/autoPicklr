@@ -51,6 +51,12 @@ class Position(SQLModel, table=True):
     stop: float
     target: float
     status: str  # OPEN/CLOSED
+    tp1_done: bool = Field(default=False)
+    tp2_done: bool = Field(default=False)
+    be_moved: bool = Field(default=False)
+    tsl_active: bool = Field(default=False)
+    tsl_high: Optional[float] = None
+
 
     # --- Exit management state ---
     tp1_done: bool = False
