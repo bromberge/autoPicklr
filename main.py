@@ -8,6 +8,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlmodel import SQLModel, create_engine, Session, select
 from sqlalchemy import text
+from sqlmodel import desc, asc
+from contextlib import asynccontextmanager
 
 from models import *
 from data import update_candles
@@ -21,7 +23,18 @@ engine = create_engine("sqlite:///picklr.db",
                        echo=False,
                        connect_args={"check_same_thread": False})
 
-app = FastAPI(title="autoPicklr Trading Simulator")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as s:
+        ensure_wallet(s)
+    # Start trading loop
+    asyncio.create_task(trading_loop())
+    yield
+    # Shutdown (nothing needed for now)
+
+app = FastAPI(title="autoPicklr Trading Simulator", lifespan=lifespan)
 
 # ---- Admin controls ----
 RUN_ENABLED = True  # simple on/off switch for the background loop
@@ -62,7 +75,10 @@ async def admin_tick():
                     sigs = compute_signals(s, sym)
                     for sig in sigs:
                         w = s.get(Wallet, 1)
-                        qty = size_position(w.balance_usd, sig.entry, sig.stop)
+                        if w is not None:
+                            qty = size_position(w.balance_usd, sig.entry, sig.stop)
+                        else:
+                            qty = 0
                         if qty > 0:
                             place_buy(s, sym, qty, sig.entry, sig.reason, sig.stop, sig.target)
                             break  # one new entry per cycle
@@ -76,7 +92,8 @@ def admin_diag():
         w = s.get(Wallet, 1)
         cash = w.balance_usd if w else None
         # peek at last order for context
-        last_order = s.exec(select(Order).order_by(Order.id.desc())).first()
+        last_order_query = select(Order).order_by(desc(Order.id))
+        last_order = s.exec(last_order_query).first()
         return {
             "cash": cash,
             "last_order": {
@@ -100,11 +117,7 @@ def ping():
 
 
 # ---- Startup tasks ----
-@app.on_event("startup")
-def create_db_and_wallet():
-    SQLModel.metadata.create_all(engine)
-    with Session(engine) as s:
-        ensure_wallet(s)
+# This is now handled in lifespan function
 
 
 @app.post("/admin/reset")
@@ -117,8 +130,8 @@ def admin_reset():
             p.status = "CLOSED"
 
         # Clear orders & trades (use raw SQL because 'order' is a reserved word)
-        s.exec(text('DELETE FROM "order"'))
-        s.exec(text("DELETE FROM trade"))
+        s.execute(text('DELETE FROM "order"'))
+        s.execute(text("DELETE FROM trade"))
         s.commit()
 
         # Reset wallet
@@ -148,8 +161,10 @@ async def trading_loop():
                             sigs = compute_signals(s, sym)
                             for sig in sigs:
                                 w = s.get(Wallet, 1)
-                                qty = size_position(w.balance_usd, sig.entry,
-                                                    sig.stop)
+                                if w is not None:
+                                    qty = size_position(w.balance_usd, sig.entry, sig.stop)
+                                else:
+                                    qty = 0
                                 if qty > 0:
                                     place_buy(s, sym, qty, sig.entry,
                                               sig.reason)
@@ -161,9 +176,7 @@ async def trading_loop():
         await asyncio.sleep(POLL_SECONDS)
 
 
-@app.on_event("startup")
-async def start_trading_loop():
-    asyncio.create_task(trading_loop())
+# This is now handled in lifespan function
 
 
 # ---- Routes ----
@@ -178,8 +191,8 @@ def sim_status():
         w = s.get(Wallet, 1)
         open_pos = s.exec(
             select(Position).where(Position.status == "OPEN")).all()
-        last_trades = s.exec(select(Trade).order_by(
-            Trade.id.desc())).all()[:10]
+        last_trades_query = select(Trade).order_by(desc(Trade.id))
+        last_trades = s.exec(last_trades_query).all()[:10]
 
         all_trades = s.exec(select(Trade)).all()
         total_pnl = sum(t.pnl_usd or 0 for t in all_trades)
@@ -223,7 +236,8 @@ def sim_status():
 @app.get("/api/orders")
 def orders():
     with Session(engine) as s:
-        xs = s.exec(select(Order).order_by(Order.id.desc())).all()[:100]
+        orders_query = select(Order).order_by(desc(Order.id))
+        xs = s.exec(orders_query).all()[:100]
         return [{
             "id": x.id,
             "ts": x.ts.isoformat(),
@@ -256,7 +270,8 @@ def positions():
 @app.get("/api/trades")
 def trades():
     with Session(engine) as s:
-        xs = s.exec(select(Trade).order_by(Trade.id.desc())).all()[:200]
+        trades_query = select(Trade).order_by(desc(Trade.id))
+        xs = s.exec(trades_query).all()[:200]
         return [{
             "id": x.id,
             "symbol": x.symbol,
@@ -284,7 +299,8 @@ def wallet():
 @app.get("/api/performance")
 def performance():
     with Session(engine) as s:
-        trades = s.exec(select(Trade).order_by(Trade.entry_ts.asc())).all()
+        performance_query = select(Trade).order_by(asc(Trade.entry_ts))
+        trades = s.exec(performance_query).all()
 
         cumulative_pnl = []
         running_total = 1000  # starting balance

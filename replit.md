@@ -8,6 +8,23 @@ autoPicklr is a cryptocurrency trading simulator that implements an automated tr
 
 Preferred communication style: Simple, everyday language.
 
+## Recent Changes (August 17, 2025)
+
+✓ Fixed FastAPI deprecated `on_event` decorators - migrated to new `lifespan` context manager
+✓ Resolved SQLModel query syntax issues with `.desc()` and `.asc()` methods
+✓ Fixed null pointer access issues with wallet balance checks
+✓ Corrected SQL execution methods for database operations
+✓ Updated all database query ordering to use proper SQLModel syntax
+✓ Added proper error handling for wallet operations in trading loop
+✓ Created `run_server.py` for easier server startup
+
+## How to Run the Application
+
+1. **Start the server**: Run `python run_server.py` or `uvicorn main:app --host 0.0.0.0 --port 5000 --reload`
+2. **Access the dashboard**: Open `http://localhost:5000` in your browser
+3. **API endpoints**: Available at `/api/*` routes for data access
+4. **Admin controls**: Use `/admin/*` endpoints to control the trading simulation
+
 ## System Architecture
 
 ### Backend Framework
