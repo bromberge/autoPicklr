@@ -10,9 +10,12 @@ from sqlmodel import SQLModel, create_engine, Session, select
 from sqlalchemy import text
 from sqlmodel import desc, asc
 from contextlib import asynccontextmanager
+from universe import UniversePair, refresh_universe, get_active_universe
+from universe import refresh_universe, get_active_universe
 
 from models import *
 from data import update_candles
+from data import update_candles_for
 from signal_engine import compute_signals
 from risk import ensure_wallet, can_open_new_position, size_position
 from sim import place_buy, mark_to_market_and_manage
@@ -162,25 +165,38 @@ async def trading_loop():
             if RUN_ENABLED:
                 print("[loop] Processing trading cycle...")
                 with Session(engine) as s:
+                    # 1) figure out symbols to work on (dynamic first, static fallback)
+                    active_syms = get_active_universe(s)
+                    if not active_syms:
+                        print("[loop] Universe cache empty/stale — refreshing…")
+                        await refresh_universe(s)
+                        active_syms = get_active_universe(s)
+                    if not active_syms:
+                        # final fallback
+                        active_syms = UNIVERSE
+                    print(f"[loop] Active symbols: {active_syms}")
+
+                    # 2) update candles (keep as-is if your update_candles() already pulls everything you need)
                     print("[loop] Updating candles...")
-                    await update_candles(s)
+                    await update_candles_for(s, active_syms)
+
+                    # 3) manage open positions
                     print("[loop] Managing positions...")
                     mark_to_market_and_manage(s)
+
+                    # 4) look for new entries across active symbols
                     print("[loop] Checking for new positions...")
                     if can_open_new_position(s):
-                        for sym in UNIVERSE:
+                        for sym in active_syms:
                             sigs = compute_signals(s, sym)
                             for sig in sigs:
                                 w = s.get(Wallet, 1)
-                                if w is not None:
-                                    qty = size_position(w.balance_usd, sig.entry, sig.stop)
-                                else:
-                                    qty = 0
+                                qty = size_position(w.balance_usd, sig.entry, sig.stop) if w else 0.0
                                 if qty > 0:
                                     print(f"[loop] Placing buy order for {sym}")
-                                    place_buy(s, sym, qty, sig.entry,
-                                              sig.reason)
+                                    place_buy(s, sym, qty, sig.entry, sig.reason)
                                     break  # one new entry per cycle
+
                     print(f"[loop] Cycle complete, sleeping for {POLL_SECONDS}s")
             else:
                 print("[loop] paused")
@@ -189,9 +205,6 @@ async def trading_loop():
             import traceback
             traceback.print_exc()
         await asyncio.sleep(POLL_SECONDS)
-
-
-# This is now handled in lifespan function
 
 
 # ---- Routes ----
@@ -437,4 +450,15 @@ def last5(symbol: str):
         rows = last_n_candles(s, symbol, n=5)
     return {"symbol": symbol, "rows": rows}
 
+@app.post("/admin/universe_refresh")
+async def admin_universe_refresh():
+    with Session(engine) as s:
+        rows = await refresh_universe(s)
+        return {"ok": True, "count": len(rows)}
+
+@app.get("/admin/universe")
+def admin_universe():
+    with Session(engine) as s:
+        syms = get_active_universe(s)
+        return {"symbols": syms}
 

@@ -9,7 +9,7 @@ def env(name, cast=str, default=None):
 WALLET_START_USD   = float(env("WALLET_START_USD", float, 1000))
 UNIVERSE           = [s.strip().upper() for s in env("UNIVERSE", str, "BTC,ETH,SOL").split(",")]
 BASE_CCY           = env("BASE_CCY", str, "USDT")
-POLL_SECONDS       = int(env("POLL_SECONDS", int, 15))
+POLL_SECONDS       = int(env("POLL_SECONDS", int, 60))
 HISTORY_MINUTES    = int(env("HISTORY_MINUTES", int, 600))
 USE_COINGECKO      = env("USE_COINGECKO", str, "true").lower() == "true"
 
@@ -72,3 +72,21 @@ BE_AFTER_FIRST_TP   = env("BE_AFTER_FIRST_TP", str, "true").lower() == "true"  #
 TSL_ACTIVATE_AFTER_TP = env("TSL_ACTIVATE_AFTER_TP", str, "true").lower() == "true"
 TSL_ACTIVATE_PCT  = float(env("TSL_ACTIVATE_PCT", float, 0.05))  # if not after TP, activate after +5%
 TSL_PCT           = float(env("TSL_PCT", float, 0.03))           # 3% trail from high
+
+# --- Live data controls ---
+COINGECKO_API_KEY = env("COINGECKO_API_KEY", str, "")  # add your key in Replit Secrets
+DATA_FETCH_INTERVAL_SECONDS = int(env("DATA_FETCH_INTERVAL_SECONDS", int, 60))  # 1 fetch/min/symbol
+
+# Dynamic universe knobs
+UNIVERSE_TOP_N = int(env("UNIVERSE_TOP_N", int, 150))          # raise cap
+UNIVERSE_CACHE_MINUTES = int(env("UNIVERSE_CACHE_MINUTES", int, 60))
+UNIVERSE_EXCLUDE = [s.strip().upper() for s in env("UNIVERSE_EXCLUDE", str, "").split(",") if s.strip()]
+UNIVERSE_INCLUDE = [s.strip().upper() for s in env("UNIVERSE_INCLUDE", str, "").split(",") if s.strip()]
+
+# Allow quotes: include USDT to dramatically expand candidates on Kraken
+ALLOWED_QUOTES = [s.strip().upper() for s in env("ALLOWED_QUOTES", str, "USD,USDT").split(",")]
+
+# Lower the 24h USD-volume threshold (Kraken’s USD markets are thinner than Binance’s)
+MIN_VOLUME_USD = float(env("MIN_VOLUME_USD", float, 5_000_000))
+
+
