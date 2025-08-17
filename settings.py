@@ -1,0 +1,24 @@
+#settings.py
+
+import os
+
+def env(name, cast=str, default=None):
+    v = os.getenv(name, default)
+    return cast(v) if v is not None else v
+
+WALLET_START_USD = float(env("WALLET_START_USD", float, 1000))
+UNIVERSE = [s.strip().upper() for s in env("UNIVERSE", str, "BTC,ETH,SOL").split(",")]
+BASE_CCY = env("BASE_CCY", str, "USDT")
+POLL_SECONDS = int(env("POLL_SECONDS", int, 60))
+MAX_OPEN_POSITIONS = int(env("MAX_OPEN_POSITIONS", int, 3))
+RISK_PCT_PER_TRADE = float(env("RISK_PCT_PER_TRADE", float, 0.02))
+FEE_PCT = float(env("FEE_PCT", float, 0.0006))
+SLIPPAGE_PCT = float(env("SLIPPAGE_PCT", float, 0.0008))
+MIN_VOLUME_USD = float(env("MIN_VOLUME_USD", float, 20_000_000))
+MIN_BREAKOUT_PCT = float(env("MIN_BREAKOUT_PCT", float, 0.0035))
+CHOOSER_THRESHOLD = float(env("CHOOSER_THRESHOLD", float, 0.60))
+DET_EMA_SHORT = int(env("DET_EMA_SHORT", int, 12))
+DET_EMA_LONG = int(env("DET_EMA_LONG", int, 26))
+HISTORY_MINUTES = int(env("HISTORY_MINUTES", int, 600))
+TELEGRAM_BOT_TOKEN = env("TELEGRAM_BOT_TOKEN", str, "")
+TELEGRAM_CHAT_ID = env("TELEGRAM_CHAT_ID", str, "")

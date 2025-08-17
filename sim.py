@@ -1,0 +1,62 @@
+#sim.py
+
+from datetime import datetime
+from sqlmodel import Session, select
+from models import Order, Position, Trade, Wallet, Candle
+from settings import FEE_PCT, SLIPPAGE_PCT
+
+def _fee(px, qty): return px * qty * FEE_PCT
+def _slip(px, side): 
+    return px * (1 + SLIPPAGE_PCT) if side=="BUY" else px * (1 - SLIPPAGE_PCT)
+
+def place_buy(session: Session, symbol: str, qty: float, price_req: float, reason: str):
+    o = Order(ts=datetime.utcnow(), symbol=symbol, side="BUY", qty=qty, price_req=price_req, status="NEW", sim=True, reason=reason)
+    session.add(o); session.commit()
+    _try_fill_new_order(session, o.id)
+
+def _latest_close(session: Session, symbol: str):
+    c = session.exec(select(Candle).where(Candle.symbol==symbol).order_by(Candle.ts.desc())).first()
+    return c.close if c else None
+
+def _try_fill_new_order(session: Session, order_id: int):
+    o = session.get(Order, order_id)
+    if o.status != "NEW": return
+    px = _latest_close(session, o.symbol)
+    if px is None: return
+    px_fill = _slip(px, o.side)
+    o.price_fill = px_fill
+    o.status = "FILLED"
+    session.add(o)
+
+    if o.side == "BUY":
+        fee = _fee(px_fill, o.qty)
+        pos = Position(symbol=o.symbol, qty=o.qty, avg_price=px_fill, opened_ts=o.ts, stop=px_fill*0.98, target=px_fill*1.085, status="OPEN")
+        session.add(pos)
+        # cash debit
+    session.commit()
+
+def mark_to_market_and_manage(session: Session):
+    # exits: stop/target on next bar
+    open_pos = session.exec(select(Position).where(Position.status=="OPEN")).all()
+    for p in open_pos:
+        px = _latest_close(session, p.symbol)
+        if not px: continue
+        hit_stop = px <= p.stop
+        hit_tgt  = px >= p.target
+        exit_px = None
+        result = None
+        if hit_stop:
+            exit_px = _slip(p.stop, "SELL")
+            result = "LOSS"
+        elif hit_tgt:
+            exit_px = _slip(p.target, "SELL")
+            result = "WIN"
+
+        if exit_px:
+            tr = Trade(symbol=p.symbol, entry_ts=p.opened_ts, exit_ts=datetime.utcnow(),
+                       entry_px=p.avg_price, exit_px=exit_px, qty=p.qty)
+            tr.pnl_usd = (exit_px - p.avg_price) * p.qty - _fee(p.avg_price, p.qty) - _fee(exit_px, p.qty)
+            tr.result = result
+            session.add(tr)
+            p.status = "CLOSED"
+    session.commit()

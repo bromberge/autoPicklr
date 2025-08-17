@@ -1,0 +1,23 @@
+#risk.py
+
+from datetime import datetime
+from sqlmodel import Session, select
+from models import Wallet, Position
+from settings import RISK_PCT_PER_TRADE, MAX_OPEN_POSITIONS
+
+def ensure_wallet(session: Session):
+    w = session.get(Wallet, 1)
+    if not w:
+        w = Wallet(id=1, balance_usd=1000.0, equity_usd=1000.0, updated_at=datetime.utcnow())
+        session.add(w); session.commit()
+    return w
+
+def can_open_new_position(session: Session) -> bool:
+    open_positions = session.exec(select(Position).where(Position.status=="OPEN")).all()
+    return len(open_positions) < MAX_OPEN_POSITIONS
+
+def size_position(balance_usd: float, entry: float, stop: float):
+    risk_usd = balance_usd * RISK_PCT_PER_TRADE
+    per_unit_risk = max(entry - stop, 0.0001)
+    qty = max(risk_usd / per_unit_risk, 0.0)
+    return qty
