@@ -227,13 +227,14 @@ async def _upsert_minute_candles_pair(session: Session, symbol: str, pair: str) 
     result = data.get("result", {})
     key = _kraken_pick_key(pair, result)  # always use the helper
     if not key:
-        # fallback: accept USD or USDT and match the base (XBT/ETH/...)
+        # accept USD or USDT and match the base (e.g., XBT/ETH/…)
         base = pair[:-3]
         key = next(
             (k for k in result.keys()
              if (k.endswith("USD") or k.endswith("USDT")) and base in k and k != "last"),
             None
         )
+
     if not key:
         print(f"[data] Kraken missing pair key for {symbol} ({pair}) in result. Keys: {list(result.keys())}")
         return 0

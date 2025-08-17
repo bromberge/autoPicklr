@@ -1,4 +1,7 @@
 # settings.py
+from dotenv import load_dotenv
+load_dotenv(override=True)  # read .env into environment
+
 import os
 
 def env(name, cast=str, default=None):
@@ -87,6 +90,6 @@ UNIVERSE_INCLUDE = [s.strip().upper() for s in env("UNIVERSE_INCLUDE", str, "").
 ALLOWED_QUOTES = [s.strip().upper() for s in env("ALLOWED_QUOTES", str, "USD,USDT").split(",")]
 
 # Lower the 24h USD-volume threshold (Kraken’s USD markets are thinner than Binance’s)
-MIN_VOLUME_USD = float(env("MIN_VOLUME_USD", float, 5_000_000))
+MIN_VOLUME_USD = float(env("MIN_VOLUME_USD", float, 1_000_000))
 
 
