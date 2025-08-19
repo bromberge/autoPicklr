@@ -1,6 +1,6 @@
 # sim.py
 
-from datetime import datetime, timezone, timedelta
+from datetime import timedelta
 from typing import Optional, List
 from sqlmodel import Session, select
 import models as M
@@ -17,8 +17,13 @@ from settings import (
 
 EPSILON = 1e-9
 
+from datetime import datetime, timezone
+
 def _utcnow():
+    """Naive UTC now (no tzinfo) for consistent DB storage."""
     return datetime.now(timezone.utc).replace(microsecond=0).replace(tzinfo=None)
+
+
 
 def get_last_price(session: Session, symbol: str) -> Optional[float]:
     c = session.exec(
@@ -121,8 +126,18 @@ def _activate_tsl_if_needed(p: M.Position, entry_px: float, last_px: float):
         p.tsl_active = True
         p.tsl_high = last_px
 
+# sim.py (replace the whole place_buy function)
+
 def place_buy(session: Session, symbol: str, qty: float, entry: float, reason: str,
-              stop: Optional[float] = None, target: Optional[float] = None):
+  stop: Optional[float] = None, target: Optional[float] = None, score: Optional[float] = None):
+
+    """
+    Enforces:
+      - Breakeven-aware per-unit edge (must beat fees+slippage by MIN_BREAKEVEN_EDGE_PCT*entry)
+      - Cash cap, Per-trade cap, Gross exposure cap
+      - Notional floor
+    Sets up position with TP/BE/TSL state for later management.
+    """
     if qty <= 0:
         return
 
@@ -132,9 +147,11 @@ def place_buy(session: Session, symbol: str, qty: float, entry: float, reason: s
     last_px = get_last_price(session, symbol) or entry
     fill_px = last_px * (1 + SLIPPAGE_PCT)
 
+    # Use provided stop/target if available; otherwise defaults
     tgt = target or (entry * (1 + TARGET_PCT))
     stp = stop   or (entry * (1 - STOP_PCT))
 
+    # ---- Breakeven-aware per-unit edge ----
     buy_cost = fill_px * (1 + FEE_PCT)
     sell_net = tgt * (1 - SLIPPAGE_PCT) * (1 - FEE_PCT)
     per_unit_edge = sell_net - buy_cost
@@ -145,6 +162,7 @@ def place_buy(session: Session, symbol: str, qty: float, entry: float, reason: s
         session.commit()
         return
 
+    # ---- Caps ----
     unit_cost = buy_cost
     if unit_cost <= 0:
         return
@@ -158,6 +176,7 @@ def place_buy(session: Session, symbol: str, qty: float, entry: float, reason: s
 
     buy_qty = min(qty, cash_cap_qty, trade_cost_cap_qty, exposure_cap_qty)
 
+    # ---- Notional floor ----
     notional = buy_qty * fill_px
     min_notional = max(MIN_TRADE_NOTIONAL, w.equity_usd * MIN_TRADE_NOTIONAL_PCT)
     if buy_qty < 1e-6 or notional < min_notional:
@@ -166,6 +185,7 @@ def place_buy(session: Session, symbol: str, qty: float, entry: float, reason: s
         session.commit()
         return
 
+    # ---- Execute buy ----
     fee = fill_px * buy_qty * FEE_PCT
     cost = fill_px * buy_qty + fee
     w.balance_usd -= cost
@@ -173,14 +193,15 @@ def place_buy(session: Session, symbol: str, qty: float, entry: float, reason: s
     _book_order(session, symbol, "BUY", buy_qty, entry, fill_px, "FILLED",
                 f"{reason} | cost={cost:.6f}")
 
-    p = session.exec(
-        select(M.Position).where(M.Position.symbol == symbol, M.Position.status == "OPEN")
-    ).first()
+    # Open or add position
+    p = session.exec(select(M.Position).where(M.Position.symbol == symbol, M.Position.status == "OPEN")).first()
     if p:
+        # average in
         total_qty = p.qty + buy_qty
         if total_qty > 0:
             p.avg_price = (p.avg_price * p.qty + fill_px * buy_qty) / total_qty
             p.qty = total_qty
+        # keep existing stop/target/flags
     else:
         p = M.Position(
             symbol=symbol,
@@ -194,14 +215,56 @@ def place_buy(session: Session, symbol: str, qty: float, entry: float, reason: s
             tp2_done=False,
             be_moved=False,
             tsl_active=False,
-            tsl_high=None
+            tsl_high=None,
         )
+        # TP1 absolute level (for dashboard)
+        if PTP_LEVELS and len(PTP_LEVELS) >= 1:
+            p.tp1_price = fill_px * (1 + PTP_LEVELS[0])
+        # if the caller passed score explicitly, store as confidence
+        if isinstance(score, (int, float)):
+            p.score = float(score)
         session.add(p)
+
+    # keep stats fresh
+    refresh_position_stats(session, p)
+
+
 
     _recalc_equity(session, w)
     session.commit()
 
+
+def refresh_position_stats(session: Session, p: M.Position):
+    last_px = get_last_price(session, p.symbol)
+    if last_px is None:
+        return
+
+    p.current_px = last_px
+    try:
+        p.pl_usd = (last_px - p.avg_price) * p.qty
+        p.pl_pct = ((last_px / p.avg_price) - 1.0) * 100.0
+    except Exception:
+        p.pl_usd = 0.0
+        p.pl_pct = 0.0
+
+    # tp1 level (store once)
+    if getattr(p, "tp1_price", None) is None and PTP_LEVELS:
+        p.tp1_price = p.avg_price * (1 + PTP_LEVELS[0])
+
+    # break-even price (only after BE is moved)
+    p.be_price = p.avg_price if p.be_moved else None
+
+    # trailing stop “visible” price if active (tsl mapped to current stop)
+    p.tsl_price = p.stop if p.tsl_active else None
+
+    # time in trade (minutes)
+    if p.opened_ts:
+        delta = _utcnow() - p.opened_ts
+        p.time_in_trade_min = int(delta.total_seconds() // 60)
+
+
 def mark_to_market_and_manage(session: Session):
+    """Every cycle: manage TP1/TP2, Break-even, Trailing, Stop/Target, and Time exit."""
     w = ensure_wallet(session)
 
     opens: List[M.Position] = session.exec(select(M.Position).where(M.Position.status == "OPEN")).all()
@@ -210,19 +273,29 @@ def mark_to_market_and_manage(session: Session):
         if last_px is None:
             continue
 
-        entry_px = p.avg_price
+        # update live fields for the dashboard
+        p.current_px = last_px
+        p.pl_usd = (last_px - p.avg_price) * p.qty
+        p.pl_pct = ((last_px / p.avg_price) - 1.0) * 100.0
 
+
+        entry_px = p.avg_price  # effective entry for calculations
+        p.current_px = last_px
+        # live P/L
+        p.pl_usd = (last_px - entry_px) * p.qty
+        p.pl_pct = ((last_px / entry_px) - 1.0) * 100.0 if entry_px > 0 else None
+
+        # ---- Partial Take-Profits ----
         tp_levels = [entry_px * (1 + g) for g in PTP_LEVELS]
-        tp_sizes  = PTP_SIZES[:] + [0.0] * max(0, len(PTP_LEVELS) - len(PTP_SIZES))
-
+        # (Your existing TP1/TP2 logic here; unchanged)
         if not p.tp1_done and len(tp_levels) >= 1 and last_px >= tp_levels[0]:
-            sell_qty = p.qty * min(1.0, tp_sizes[0])
+            sell_qty = p.qty * min(1.0, PTP_SIZES[0] if PTP_SIZES else 0.0)
             if sell_qty > 0:
                 _partial_close(session, p, sell_qty, tp_levels[0], "TP1")
                 p.tp1_done = True
 
-        if not p.tp2_done and len(tp_levels) >= 2 and last_px >= tp_levels[1] and p.status == "OPEN":
-            sell_qty = p.qty * min(1.0, tp_sizes[1])
+        if p.status == "OPEN" and not p.tp2_done and len(tp_levels) >= 2 and last_px >= tp_levels[1]:
+            sell_qty = p.qty * min(1.0, PTP_SIZES[1] if len(PTP_SIZES) >= 2 else 0.0)
             if sell_qty > 0:
                 _partial_close(session, p, sell_qty, tp_levels[1], "TP2")
                 p.tp2_done = True
@@ -230,6 +303,7 @@ def mark_to_market_and_manage(session: Session):
         if p.status != "OPEN":
             continue
 
+        # ---- Break-Even stop move ----
         if not p.be_moved:
             gain_ok = last_px >= entry_px * (1 + BE_TRIGGER_PCT)
             tp1_ok  = p.tp1_done if BE_AFTER_FIRST_TP else False
@@ -237,13 +311,22 @@ def mark_to_market_and_manage(session: Session):
                 p.stop = max(p.stop, entry_px)
                 p.be_moved = True
 
+        # Surface BE as a price for the dashboard when moved
+        p.be_price = entry_px if p.be_moved else None
+
+        # ---- Trailing stop activation + update ----
         _activate_tsl_if_needed(p, entry_px, last_px)
         if p.tsl_active:
             if p.tsl_high is None or last_px > p.tsl_high:
                 p.tsl_high = last_px
             dyn_trail_stop = p.tsl_high * (1 - TSL_PCT)
             p.stop = max(p.stop, dyn_trail_stop)
+            p.tsl_price = p.stop
+            p.tsl_price = p.stop
+        else:
+            p.tsl_price = None
 
+        # ---- Hard Stop / Target (for any remaining qty) ----
         if p.qty > 0:
             if last_px <= p.stop:
                 _close_position(session, p, p.stop, "STOP/TSL")
@@ -252,11 +335,20 @@ def mark_to_market_and_manage(session: Session):
                 _close_position(session, p, p.target, "TARGET")
                 continue
 
+        # ---- Time-based exit ----
         if p.status == "OPEN" and p.opened_ts is not None:
             age = (_utcnow() - p.opened_ts)
             if age >= timedelta(minutes=MAX_HOLD_MINUTES):
                 _close_position(session, p, last_px, "TIME")
                 continue
 
+    # refresh stats for all remaining open positions
+    opens2: List[M.Position] = session.exec(select(M.Position).where(M.Position.status == "OPEN")).all()
+    for p2 in opens2:
+        refresh_position_stats(session, p2)
+
+
+    # refresh account equity (wallet: cash + MV of positions)
     _recalc_equity(session, w)
     session.commit()
+

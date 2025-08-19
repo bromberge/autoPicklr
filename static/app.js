@@ -1,272 +1,168 @@
-// static/app.js
+// /static/app.js  (v4)
 
-let equityChart = null;
+// ---------- tiny helpers ----------
+const $ = (id) => document.getElementById(id);
+const fmtUSD = (n) =>
+  (isFinite(n) ? (n < 0 ? "-$" : "$") + Math.abs(n).toLocaleString(undefined, { maximumFractionDigits: 2 }) : "—");
+const fmtNum = (n, d = 2) => (isFinite(n) ? n.toFixed(d) : "—");
+const badge = (txt) => `<span class="badge badge-conf">${txt}</span>`;
 
-// Initialize the dashboard
-document.addEventListener('DOMContentLoaded', function() {
-    initializeEquityChart();
-    refreshData();
-    
-    // Auto-refresh every 30 seconds
-    setInterval(refreshData, 30000);
-});
-
-function initializeEquityChart() {
-    const ctx = document.getElementById('equityChart').getContext('2d');
-    equityChart = new Chart(ctx, {
-        type: 'line',
-        data: {
-            labels: [],
-            datasets: [{
-                label: 'Portfolio Value',
-                data: [],
-                borderColor: 'rgb(13, 202, 240)',
-                backgroundColor: 'rgba(13, 202, 240, 0.1)',
-                tension: 0.4,
-                fill: true
-            }]
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: {
-                legend: {
-                    display: false
-                }
-            },
-            scales: {
-                x: {
-                    display: true,
-                    grid: {
-                        color: 'rgba(255, 255, 255, 0.1)'
-                    },
-                    ticks: {
-                        color: 'rgba(255, 255, 255, 0.7)'
-                    }
-                },
-                y: {
-                    display: true,
-                    grid: {
-                        color: 'rgba(255, 255, 255, 0.1)'
-                    },
-                    ticks: {
-                        color: 'rgba(255, 255, 255, 0.7)',
-                        callback: function(value) {
-                            return '$' + value.toFixed(2);
-                        }
-                    }
-                }
-            },
-            interaction: {
-                intersect: false,
-                mode: 'index'
-            }
-        }
-    });
+async function getJSON(url) {
+  const r = await fetch(url, { cache: "no-store" });
+  if (!r.ok) throw new Error(`${url} -> ${r.status}`);
+  return r.json();
 }
 
+// ---------- charts ----------
+let equityChart;
+function renderEquityCurve(curve) {
+  const ctx = document.getElementById("equityChart");
+  if (!ctx) return;
+  const labels = curve.map(p => p.ts || p[0] || "");
+  const data = curve.map(p => Number(p.equity ?? p[1] ?? NaN));
+
+  if (equityChart) { equityChart.destroy(); }
+  equityChart = new Chart(ctx, {
+    type: "line",
+    data: {
+      labels,
+      datasets: [{
+        label: "Equity",
+        data,
+        borderWidth: 2,
+        fill: false,
+        tension: 0.25
+      }]
+    },
+    options: {
+      responsive: true,
+      scales: {
+        x: { display: labels.length > 0 },
+        y: { beginAtZero: false }
+      },
+      plugins: { legend: { display: false } }
+    }
+  });
+}
+
+// ---------- render sections ----------
+function renderMetrics(sim, perf) {
+  const eq = Number(sim.wallet_equity ?? perf.current_equity ?? 0);
+  const pnl = Number(sim.total_pnl ?? 0);
+  const win = Number(sim.win_rate ?? 0);
+  const open = Number(sim.open_positions_count ?? (sim.open_positions?.length ?? 0));
+
+  $("portfolio-value").textContent = fmtUSD(eq);
+  $("total-pnl").textContent = fmtUSD(pnl);
+  $("win-rate").textContent = `${fmtNum(win,0)}%`;
+  $("open-positions").textContent = String(open);
+}
+
+function renderPositions(sim) {
+  const tbody = $("positions-tbody");
+  if (!tbody) return;
+  const pos = sim.open_positions || [];
+  if (!pos.length) {
+    tbody.innerHTML = `<tr><td colspan="12" class="text-center text-muted">No open positions</td></tr>`;
+    return;
+  }
+
+  const rows = pos.map(p => {
+    const qty   = Number(p.qty ?? 0);
+    const avg   = Number(p.avg ?? p.entry ?? 0);
+    const price = Number(p.price ?? NaN);   // our newer /api/sim returns price; if not, will show "—"
+    const plUsd = Number(p.pl_usd ?? (isFinite(price) ? (price - avg) * qty : NaN));
+    const plPct = Number(p.pl_pct ?? (isFinite(price) && avg ? ((price/avg)-1)*100 : NaN));
+    const conf  = (p.confidence ?? p.score ?? null);
+    const tp1   = p.tp1 ?? p.tp1_price ?? null;
+    const be    = p.be  ?? p.be_price  ?? (p.be_moved ? avg : null);
+    const tsl   = p.tsl ?? p.tsl_price ?? null;
+
+    const clsUsd = isFinite(plUsd) ? (plUsd >= 0 ? "neon-pos" : "neon-neg") : "";
+    const clsPct = isFinite(plPct) ? (plPct >= 0 ? "neon-pos" : "neon-neg") : "";
+
+    return `
+      <tr class="row-glow">
+        <td>${p.symbol}</td>
+        <td class="text-end">${fmtNum(qty, 4)}</td>
+        <td class="text-end">${fmtNum(avg, 4)}</td>
+        <td class="text-end">${isFinite(price) ? fmtNum(price, 4) : "—"}</td>
+        <td class="text-end ${clsUsd}">${fmtUSD(plUsd)}</td>
+        <td class="text-end ${clsPct}">${isFinite(plPct) ? fmtNum(plPct,2)+"%" : "—"}</td>
+        <td class="text-center">${conf == null ? "—" : badge(fmtNum(Number(conf)*100,0)+"%")}</td>
+        <td class="text-end">${tp1 == null ? "—" : fmtNum(Number(tp1), 4)}</td>
+        <td class="text-end">${be  == null ? "—" : fmtNum(Number(be), 4)}</td>
+        <td class="text-end">${tsl == null ? "—" : fmtNum(Number(tsl), 4)}</td>
+        <td class="text-end">${fmtNum(Number(p.stop ?? NaN), 4)}</td>
+        <td class="text-end">${fmtNum(Number(p.target ?? NaN), 4)}</td>
+      </tr>`;
+  });
+
+  tbody.innerHTML = rows.join("");
+}
+
+function renderRecentTrades(list) {
+  const tbody = $("trades-list");
+  if (!tbody) return;
+  const rows = (list || []).slice(0, 10).map(t => `
+    <tr>
+      <td>${t.symbol}</td>
+      <td class="text-end">${fmtNum(Number(t.entry_px ?? t.entry ?? NaN), 4)}</td>
+      <td class="text-end">${fmtNum(Number(t.exit_px  ?? t.exit  ?? NaN), 4)}</td>
+      <td class="text-end">${fmtNum(Number(t.qty ?? 0), 6)}</td>
+      <td class="text-end ${Number(t.pnl_usd ?? 0) >= 0 ? "neon-pos" : "neon-neg"}">${fmtUSD(Number(t.pnl_usd ?? 0))}</td>
+      <td class="text-center">${t.result ?? "—"}</td>
+    </tr>
+  `);
+  tbody.innerHTML = rows.length ? rows.join("") : `<tr><td colspan="6" class="text-center text-muted">No trades yet</td></tr>`;
+}
+
+function renderOrders(list) {
+  const tbody = $("orders-tbody");
+  if (!tbody) return;
+  const rows = (list || []).slice(-50).reverse().map(o => `
+    <tr>
+      <td>${o.ts?.replace("T"," ").slice(0,19) ?? "—"}</td>
+      <td>${o.symbol}</td>
+      <td>${o.side}</td>
+      <td class="text-end">${fmtNum(Number(o.qty ?? 0), 6)}</td>
+      <td class="text-end">${fmtNum(Number(o.price_req ?? NaN), 6)}</td>
+      <td class="text-end">${fmtNum(Number(o.price_fill ?? NaN), 6)}</td>
+      <td>${o.status}</td>
+      <td>${o.reason ?? ""}</td>
+    </tr>
+  `);
+  tbody.innerHTML = rows.length ? rows.join("") : `<tr><td colspan="8" class="text-center text-muted">No orders yet</td></tr>`;
+}
+
+// tabs
+window.showTab = function(tab) {
+  document.getElementById("orders-tab").style.display = (tab === "orders" ? "block" : "none");
+  document.getElementById("trades-tab").style.display = (tab === "trades" ? "block" : "none");
+};
+
+// ---------- main refresh ----------
 async function refreshData() {
-    try {
-        // Update portfolio metrics
-        const simData = await fetch('/api/sim').then(r => r.json());
-        updatePortfolioMetrics(simData);
-        updatePositions(simData.open_positions);
-        updateRecentTrades(simData.recent_trades);
-        
-        // Update performance chart
-        const performanceData = await fetch('/api/performance').then(r => r.json());
-        updateEquityChart(performanceData.equity_curve);
-        
-        // Update orders and trades tables
-        const ordersData = await fetch('/api/orders').then(r => r.json());
-        const tradesData = await fetch('/api/trades').then(r => r.json());
-        updateOrdersTable(ordersData);
-        updateTradesTable(tradesData);
-        
-    } catch (error) {
-        console.error('Error refreshing data:', error);
-    }
+  try {
+    const [sim, perf, orders, trades] = await Promise.all([
+      getJSON("/api/sim"),
+      getJSON("/api/performance"),
+      getJSON("/api/orders"),
+      getJSON("/api/trades")
+    ]);
+
+    renderMetrics(sim, perf);
+    renderEquityCurve(perf.equity_curve || []);
+    renderPositions(sim);
+    renderOrders(orders || []);
+    renderRecentTrades(trades || []);
+  } catch (e) {
+    console.error("refresh error", e);
+  }
 }
 
-function updatePortfolioMetrics(data) {
-    document.getElementById('portfolio-value').textContent = '$' + (data.wallet_equity || 0).toFixed(2);
-    
-    const pnlElement = document.getElementById('total-pnl');
-    const pnl = data.total_pnl || 0;
-    pnlElement.textContent = '$' + pnl.toFixed(2);
-    pnlElement.className = pnl >= 0 ? 'text-success' : 'text-danger';
-    
-    document.getElementById('win-rate').textContent = (data.win_rate || 0).toFixed(1) + '%';
-    document.getElementById('open-positions').textContent = data.open_positions_count || 0;
-}
-
-function updatePositions(positions) {
-    const container = document.getElementById('positions-list');
-    
-    if (!positions || positions.length === 0) {
-        container.innerHTML = `
-            <div class="text-center text-muted py-4">
-                <i class="fas fa-chart-line fa-3x mb-3"></i>
-                <p>No open positions</p>
-            </div>
-        `;
-        return;
-    }
-    
-    container.innerHTML = positions.map(pos => `
-        <div class="border-bottom border-secondary pb-3 mb-3">
-            <div class="d-flex justify-content-between align-items-center">
-                <div>
-                    <h6 class="mb-1">${pos.symbol}</h6>
-                    <small class="text-muted">Qty: ${pos.qty.toFixed(4)}</small>
-                </div>
-                <div class="text-end">
-                    <div class="text-info">$${pos.entry.toFixed(2)}</div>
-                    <small class="text-muted">Entry</small>
-                </div>
-            </div>
-            <div class="row mt-2">
-                <div class="col-6">
-                    <small class="text-danger">Stop: $${pos.stop.toFixed(2)}</small>
-                </div>
-                <div class="col-6 text-end">
-                    <small class="text-success">Target: $${pos.target.toFixed(2)}</small>
-                </div>
-            </div>
-        </div>
-    `).join('');
-}
-
-function updateRecentTrades(trades) {
-    const container = document.getElementById('trades-list');
-    
-    if (!trades || trades.length === 0) {
-        container.innerHTML = `
-            <div class="text-center text-muted py-4">
-                <i class="fas fa-exchange-alt fa-3x mb-3"></i>
-                <p>No trades yet</p>
-            </div>
-        `;
-        return;
-    }
-    
-    container.innerHTML = trades.slice(0, 5).map(trade => `
-        <div class="border-bottom border-secondary pb-2 mb-2">
-            <div class="d-flex justify-content-between align-items-center">
-                <div>
-                    <span class="fw-bold">${trade.symbol}</span>
-                    <span class="status-indicator ${trade.result === 'WIN' ? 'status-win' : 'status-loss'}"></span>
-                </div>
-                <div class="text-end">
-                    <div class="${trade.pnl >= 0 ? 'text-success' : 'text-danger'}">
-                        $${trade.pnl.toFixed(2)}
-                    </div>
-                    <small class="text-muted">${formatDateTime(trade.entry_ts)}</small>
-                </div>
-            </div>
-        </div>
-    `).join('');
-}
-
-function updateEquityChart(equityData) {
-    if (!equityData || equityData.length === 0) {
-        equityChart.data.labels = [];
-        equityChart.data.datasets[0].data = [];
-    } else {
-        equityChart.data.labels = equityData.map(point => formatDate(point.date));
-        equityChart.data.datasets[0].data = equityData.map(point => point.equity);
-    }
-    equityChart.update('none');
-}
-
-function updateOrdersTable(orders) {
-    const tbody = document.getElementById('orders-tbody');
-    
-    if (!orders || orders.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted">No orders yet</td></tr>';
-        return;
-    }
-    
-    tbody.innerHTML = orders.slice(0, 20).map(order => `
-        <tr>
-            <td>${formatDateTime(order.ts)}</td>
-            <td><span class="badge bg-primary">${order.symbol}</span></td>
-            <td><span class="badge ${order.side === 'BUY' ? 'bg-success' : 'bg-danger'}">${order.side}</span></td>
-            <td>${order.qty.toFixed(4)}</td>
-            <td>$${(order.price_fill || order.price_req).toFixed(2)}</td>
-            <td><span class="badge ${getStatusColor(order.status)}">${order.status}</span></td>
-        </tr>
-    `).join('');
-}
-
-function updateTradesTable(trades) {
-    const tbody = document.getElementById('trades-tbody');
-    
-    if (!trades || trades.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted">No trades yet</td></tr>';
-        return;
-    }
-    
-    tbody.innerHTML = trades.slice(0, 50).map(trade => `
-        <tr>
-            <td><span class="badge bg-primary">${trade.symbol}</span></td>
-            <td>$${trade.entry_px.toFixed(2)}</td>
-            <td>$${(trade.exit_px || 0).toFixed(2)}</td>
-            <td>${trade.qty.toFixed(4)}</td>
-            <td class="${(trade.pnl_usd || 0) >= 0 ? 'text-success' : 'text-danger'}">
-                $${(trade.pnl_usd || 0).toFixed(2)}
-            </td>
-            <td>
-                <span class="badge ${trade.result === 'WIN' ? 'bg-success' : 'bg-danger'}">
-                    ${trade.result || 'OPEN'}
-                </span>
-            </td>
-        </tr>
-    `).join('');
-}
-
-function showTab(tabName) {
-    // Hide all tabs
-    document.querySelectorAll('.activity-tab').forEach(tab => {
-        tab.style.display = 'none';
-    });
-    
-    // Show selected tab
-    document.getElementById(tabName + '-tab').style.display = 'block';
-    
-    // Update button states
-    document.querySelectorAll('.btn-group button').forEach(btn => {
-        btn.classList.remove('active');
-    });
-    event.target.classList.add('active');
-}
-
-function getStatusColor(status) {
-    switch(status) {
-        case 'FILLED': return 'bg-success';
-        case 'NEW': return 'bg-warning';
-        case 'CANCELLED': return 'bg-secondary';
-        case 'REJECTED': return 'bg-danger';
-        default: return 'bg-info';
-    }
-}
-
-function formatDateTime(isoString) {
-    if (!isoString) return 'N/A';
-    const date = new Date(isoString);
-    return date.toLocaleString('en-US', {
-        month: 'short',
-        day: 'numeric',
-        hour: '2-digit',
-        minute: '2-digit'
-    });
-}
-
-function formatDate(isoString) {
-    if (!isoString) return 'N/A';
-    const date = new Date(isoString);
-    return date.toLocaleDateString('en-US', {
-        month: 'short',
-        day: 'numeric'
-    });
-}
+window.addEventListener("load", () => {
+  refreshData();
+  // auto-refresh light cadence
+  setInterval(refreshData, 10000);
+});

@@ -12,7 +12,7 @@ def env(name, cast=str, default=None):
 WALLET_START_USD   = float(env("WALLET_START_USD", float, 1000))
 UNIVERSE           = [s.strip().upper() for s in env("UNIVERSE", str, "BTC,ETH,SOL").split(",")]
 BASE_CCY           = env("BASE_CCY", str, "USDT")
-POLL_SECONDS       = int(env("POLL_SECONDS", int, 60))
+POLL_SECONDS       = int(env("POLL_SECONDS", int, 300))
 HISTORY_MINUTES    = int(env("HISTORY_MINUTES", int, 600))
 USE_COINGECKO      = env("USE_COINGECKO", str, "true").lower() == "true"
 
@@ -99,3 +99,13 @@ SIGNAL_MIN_NOTIONAL_USD = float(env("SIGNAL_MIN_NOTIONAL_USD", float, 25.0))
 # How often to rebuild the symbol list from Kraken
 UNIVERSE_REFRESH_MINUTES = int(env("UNIVERSE_REFRESH_MINUTES", int, 15))
 
+# Signal gates / chooser
+REQUIRE_BREAKOUT = True         # require breakout >= MIN_BREAKOUT_PCT to be tradable
+COOLDOWN_MINUTES = 60           # don’t rebuy same symbol within this many minutes
+MAX_NEW_POSITIONS_PER_CYCLE = 1 # already present in your loop; keep at 1-2 tops
+SIGNAL_MIN_NOTIONAL_USD = 10.0  # already present; keep sane
+
+# Quality filters
+MAX_EXTENSION_PCT = 0.03  # price no more than 3% above ema_long at entry
+MIN_RR = 2.0              # (target - entry) / (entry - stop) must be >= 2
+EMA_SLOPE_LOOKBACK = 5    # bars to look back for long-ema slope > 0

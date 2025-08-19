@@ -51,19 +51,22 @@ class Position(SQLModel, table=True):
     stop: float
     target: float
     status: str  # OPEN/CLOSED
-    tp1_done: bool = Field(default=False)
-    tp2_done: bool = Field(default=False)
-    be_moved: bool = Field(default=False)
-    tsl_active: bool = Field(default=False)
-    tsl_high: Optional[float] = None
 
-
-    # --- Exit management state ---
+    # --- live stats for dashboard ---
+    current_px: Optional[float] = None
+    pl_usd: Optional[float] = None
+    pl_pct: Optional[float] = None
+    score: Optional[float] = None            # “confidence”
+    be_price: Optional[float] = None         # break-even price if moved
+    tp1_price: Optional[float] = None        # absolute price for TP1 (if configured)
+    tsl_price: Optional[float] = None        # current trailing stop price (if active)
     tp1_done: bool = False
     tp2_done: bool = False
-    be_moved: bool = False           # stop moved to breakeven?
-    tsl_active: bool = False         # trailing stop running?
-    tsl_high: Optional[float] = None # highest price since TSL activated
+    be_moved: bool = False
+    tsl_active: bool = False
+    tsl_high: Optional[float] = None
+    time_in_trade_min: Optional[float] = None
+
 
 class Trade(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -75,3 +78,4 @@ class Trade(SQLModel, table=True):
     qty: float
     pnl_usd: Optional[float] = None
     result: Optional[str] = None  # WIN/LOSS/FLAT/TIME
+    duration_min: Optional[float] = None
