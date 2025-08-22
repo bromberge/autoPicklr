@@ -1,97 +1,106 @@
 # signal_engine.py
-
-from typing import List, Optional
-from sqlmodel import Session, select
-from models import Candle, Signal
-from settings import (
-    DET_EMA_SHORT, DET_EMA_LONG,
-    MIN_BREAKOUT_PCT, MIN_VOLUME_USD, CHOOSER_THRESHOLD,
-    BREAKOUT_LOOKBACK, STOP_PCT, TARGET_PCT,
-    MIN_EMA_SPREAD, ENABLE_DEBUG_SIGNALS
-)
-
-def ema(arr: List[float], span: int) -> List[float]:
-    k = 2 / (span + 1)
-    out: List[float] = []
-    s = None
-    for x in arr:
-        s = x if s is None else (x - s) * k + s
-        out.append(s)
-    return out
-
-def _last_candle(session: Session, symbol: str) -> Optional[Candle]:
-    return session.exec(
-        select(Candle).where(Candle.symbol == symbol).order_by(Candle.ts.desc())
-    ).first()
-
 from typing import List
 from sqlmodel import Session, select
-from models import Candle, Signal
-from settings import DET_EMA_SHORT, DET_EMA_LONG, MIN_BREAKOUT_PCT, CHOOSER_THRESHOLD
 
-def ema(arr: List[float], span: int) -> List[float]:
+from models import Candle, Signal
+from ml_runtime import model_predict_for_symbol, hourly_atr_from_db
+from settings import (
+    USE_MODEL, MIN_BREAKOUT_PCT,
+    DET_EMA_SHORT, DET_EMA_LONG,
+    BREAKOUT_LOOKBACK, EMA_SLOPE_LOOKBACK,
+    STOP_PCT, TARGET_PCT,
+    USE_ATR_STOPS, ATR_STOP_MULT, ATR_TARGET_MULT,
+)
+
+def _ema(arr: List[float], span: int) -> List[float]:
     k = 2 / (span + 1)
-    out = []
-    s = None
+    out, s = [], None
     for x in arr:
         s = x if s is None else (x - s) * k + s
         out.append(s)
     return out
 
 def compute_signals(session: Session, symbol: str) -> List[Signal]:
-    # Pull full candle history for this symbol (already filled by update_candles_for)
     candles = session.exec(
         select(Candle).where(Candle.symbol == symbol).order_by(Candle.ts.asc())
     ).all()
-
-    # Need enough history to compute EMAs and a small breakout window
-    min_needed = max(DET_EMA_LONG + 5, 40)
+    min_needed = max(DET_EMA_LONG + EMA_SLOPE_LOOKBACK + 5, 40)
     if len(candles) < min_needed:
         return []
 
-    closes = [c.close for c in candles]
-    e1 = ema(closes, DET_EMA_SHORT)
-    e2 = ema(closes, DET_EMA_LONG)
+    closes = [float(c.close) for c in candles]
+    e_short = _ema(closes, DET_EMA_SHORT)
+    e_long  = _ema(closes, DET_EMA_LONG)
 
     last = candles[-1]
-    last_e1, last_e2 = e1[-1], e2[-1]
+    px   = float(last.close)
+    eS   = float(e_short[-1])
+    eL   = float(e_long[-1])
 
-    # 20-bar breakout (you can parameterize if you want)
-    lookback = 20
-    recent_high = max(closes[-lookback:])
-    breakout = 0.0
-    if recent_high > 0:
-        breakout = (last.close - recent_high) / recent_high
+    # breakout vs recent high (exclude current if possible)
+    lb = BREAKOUT_LOOKBACK
+    recent_high = max(closes[-(lb+1):-1]) if len(closes) > lb else max(closes)
+    breakout = (px - recent_high) / recent_high if recent_high > 0 else 0.0
 
-    # --- scoring ---
-    momentum_ok = last_e1 > last_e2
-    breakout_ok = breakout >= MIN_BREAKOUT_PCT
+    # EMA(long) slope
+    if len(e_long) > EMA_SLOPE_LOOKBACK:
+        eL_ago = float(e_long[-(EMA_SLOPE_LOOKBACK + 1)])
+    else:
+        eL_ago = eL
+    ema_long_slope = (eL - eL_ago) / max(1, EMA_SLOPE_LOOKBACK)
 
-    # IMPORTANT: volume gate removed here — universe filter already enforces 24h liquidity
-    vol_ok = True
+    # ATR stops/targets (fallback to %)
+    if USE_ATR_STOPS:
+        atr = hourly_atr_from_db(session, symbol)
+        if atr and atr > 0:
+            stop   = px - ATR_STOP_MULT   * atr
+            target = px + ATR_TARGET_MULT * atr
+        else:
+            stop   = px * (1.0 - STOP_PCT)
+            target = px * (1.0 + TARGET_PCT)
+    else:
+        stop   = px * (1.0 - STOP_PCT)
+        target = px * (1.0 + TARGET_PCT)
 
+    # Score: model first, else heuristic
     score = 0.0
-    if momentum_ok: score += 0.4
-    if breakout_ok: score += 0.3
-    if vol_ok:      score += 0.3
+    if USE_MODEL:
+        try:
+            p = model_predict_for_symbol(session, symbol)
+            if p is not None:
+                score = float(p)
+        except Exception as e:
+            print(f"[model] scoring failed for {symbol}: {e}")
 
-    if score < CHOOSER_THRESHOLD:
-        return []
+    if (not USE_MODEL) or score == 0.0:
+        score = 0.0
+        if eS > eL:               # momentum
+            score += 0.5
+        if breakout >= MIN_BREAKOUT_PCT:
+            score += 0.5
 
-    # Risk/targets (keep consistent with your settings or entries)
-    entry  = last.close
-    stop   = entry * (1 - 0.02)   # 2% stop  (feel free to pull from settings)
-    target = entry * (1 + 0.06)   # 6% target (same here)
-
+    # package
     sig = Signal(
         symbol=symbol,
         ts=last.ts,
-        score=round(score, 3),
-        entry=entry,
-        stop=stop,
-        target=target,
+        score=round(score, 4),
+        entry=px,
+        stop=float(stop),
+        target=float(target),
         reason=f"EMA{DET_EMA_SHORT}>{DET_EMA_LONG}, breakout≥{MIN_BREAKOUT_PCT:.2%}"
     )
-    print(f"[signal] {symbol}: mom={momentum_ok} brk={breakout_ok:.4f} score={score:.2f}")
-    return [sig]
 
+    # extras for chooser / debug panels
+    try:
+        sig.breakout_pct    = float(breakout)
+        sig.ema_spread      = (eS - eL) / px if px > 0 else 0.0
+        sig.ema_long        = eL
+        sig.ema_long_ago    = eL_ago
+        sig.ema_long_slope  = ema_long_slope
+        sig.extension_pct   = (px / eL - 1.0) if eL > 0 else 0.0
+        rr_den = max(px - stop, 1e-12)
+        sig.rr = (target - px) / rr_den
+    except Exception:
+        pass
+
+    return [sig]

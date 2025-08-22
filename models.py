@@ -3,12 +3,16 @@
 from typing import Optional
 from datetime import datetime
 from sqlmodel import SQLModel, Field
+from sqlalchemy import Column, DateTime
 
 class Wallet(SQLModel, table=True):
     id: int = Field(default=1, primary_key=True)
     balance_usd: float
     equity_usd: float
-    updated_at: datetime
+    updated_at: datetime = Field(
+        default_factory=datetime.utcnow,                         # set on INSERT
+        sa_column=Column(DateTime, nullable=False, onupdate=datetime.utcnow)  # bump on UPDATE
+    )
 
 class Candle(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)

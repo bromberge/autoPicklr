@@ -9,10 +9,10 @@ def env(name, cast=str, default=None):
     return cast(v) if v is not None else v
 
 # --- Account / runtime ---
-WALLET_START_USD   = float(env("WALLET_START_USD", float, 1000))
+WALLET_START_USD   = float(env("WALLET_START_USD", float, 10000))
 UNIVERSE           = [s.strip().upper() for s in env("UNIVERSE", str, "BTC,ETH,SOL").split(",")]
 BASE_CCY           = env("BASE_CCY", str, "USDT")
-POLL_SECONDS       = int(env("POLL_SECONDS", int, 300))
+POLL_SECONDS       = int(env("POLL_SECONDS", int, 60))
 HISTORY_MINUTES    = int(env("HISTORY_MINUTES", int, 600))
 USE_COINGECKO      = env("USE_COINGECKO", str, "true").lower() == "true"
 
@@ -38,17 +38,14 @@ HOLDING_DAYS       = int(env("HOLDING_DAYS", int, 4))
 MAX_HOLD_MINUTES   = HOLDING_DAYS * 1440  # used by time-based exit
 
 # PicklrMVP: “min_volume_usd”
-MIN_VOLUME_USD     = float(env("MIN_VOLUME_USD", float, 20_000_000))
+MIN_VOLUME_USD     = float(env("MIN_VOLUME_USD", float, 1_000_000))
 
 # PicklrMVP: “target_pct” and “stop_pct”
 TARGET_PCT         = float(env("TARGET_PCT", float, 0.095))  # 9.5%
 STOP_PCT           = float(env("STOP_PCT",   float, 0.02))   # 2.0%
 
-# PicklrMVP: “min_breakout_pct”
-MIN_BREAKOUT_PCT   = float(env("MIN_BREAKOUT_PCT", float, 0.0035))  # 0.35%
-
-# PicklrMVP: “min_ema_spread” (EMA separation as a % of price)
-MIN_EMA_SPREAD     = float(env("MIN_EMA_SPREAD", float, 0.005))     # 0.5%
+MIN_BREAKOUT_PCT   = float(env("MIN_BREAKOUT_PCT", float, 0.0035))  # 0.35%, not 3.5%
+MIN_EMA_SPREAD     = float(env("MIN_EMA_SPREAD", float, 0.005))     # 0.5% default
 
 # Other chooser knobs
 BREAKOUT_LOOKBACK  = int(env("BREAKOUT_LOOKBACK", int, 20))
@@ -74,7 +71,7 @@ BE_AFTER_FIRST_TP   = env("BE_AFTER_FIRST_TP", str, "true").lower() == "true"  #
 # Trailing stop: start trailing after first TP; trail by this percent from highest price since activation
 TSL_ACTIVATE_AFTER_TP = env("TSL_ACTIVATE_AFTER_TP", str, "true").lower() == "true"
 TSL_ACTIVATE_PCT  = float(env("TSL_ACTIVATE_PCT", float, 0.05))  # if not after TP, activate after +5%
-TSL_PCT           = float(env("TSL_PCT", float, 0.03))           # 3% trail from high
+TSL_PCT           = float(env("TSL_PCT", float, 0.06))           # 3% trail from high
 
 # --- Live data controls ---
 COINGECKO_API_KEY = env("COINGECKO_API_KEY", str, "")  # add your key in Replit Secrets
@@ -93,19 +90,54 @@ ALLOWED_QUOTES = [s.strip().upper() for s in env("ALLOWED_QUOTES", str, "USD,USD
 MIN_VOLUME_USD = float(env("MIN_VOLUME_USD", float, 1_000_000))
 
 # Trade selection knobs
-MAX_NEW_POSITIONS_PER_CYCLE = int(env("MAX_NEW_POSITIONS_PER_CYCLE", int, 1))
-SIGNAL_MIN_NOTIONAL_USD = float(env("SIGNAL_MIN_NOTIONAL_USD", float, 25.0))
+MAX_NEW_POSITIONS_PER_CYCLE = int(env("MAX_NEW_POSITIONS_PER_CYCLE", int, 2))
+SIGNAL_MIN_NOTIONAL_USD = float(env("SIGNAL_MIN_NOTIONAL_USD", float, 10.0))
 
 # How often to rebuild the symbol list from Kraken
 UNIVERSE_REFRESH_MINUTES = int(env("UNIVERSE_REFRESH_MINUTES", int, 15))
 
-# Signal gates / chooser
-REQUIRE_BREAKOUT = True         # require breakout >= MIN_BREAKOUT_PCT to be tradable
-COOLDOWN_MINUTES = 60           # don’t rebuy same symbol within this many minutes
-MAX_NEW_POSITIONS_PER_CYCLE = 1 # already present in your loop; keep at 1-2 tops
-SIGNAL_MIN_NOTIONAL_USD = 10.0  # already present; keep sane
+# Signal gates / chooser (env-backed)
+REQUIRE_BREAKOUT = env("REQUIRE_BREAKOUT", str, "true").lower() == "true"
+COOLDOWN_MINUTES = int(env("COOLDOWN_MINUTES", int, 60))
+MAX_NEW_POSITIONS_PER_CYCLE = int(env("MAX_NEW_POSITIONS_PER_CYCLE", int, 2))
+SIGNAL_MIN_NOTIONAL_USD = float(env("SIGNAL_MIN_NOTIONAL_USD", float, 10.0))
 
-# Quality filters
-MAX_EXTENSION_PCT = 0.03  # price no more than 3% above ema_long at entry
-MIN_RR = 2.0              # (target - entry) / (entry - stop) must be >= 2
-EMA_SLOPE_LOOKBACK = 5    # bars to look back for long-ema slope > 0
+# Quality filters (env-backed)
+MAX_EXTENSION_PCT   = float(env("MAX_EXTENSION_PCT", float, 0.03))
+MIN_RR              = float(env("MIN_RR", float, 2.0))
+EMA_SLOPE_LOOKBACK  = int(env("EMA_SLOPE_LOOKBACK", int, 5))
+
+# Debug
+ENABLE_DEBUG_SIGNALS = env("ENABLE_DEBUG_SIGNALS", str, "false").lower() == "true"
+
+# Trend fallback (allows entries on strong uptrends without a strict breakout)
+ALLOW_TREND_ENTRY = env("ALLOW_TREND_ENTRY", str, "true").lower() == "true"
+EMA_SLOPE_MIN = float(env("EMA_SLOPE_MIN", float, 0.0))  # require slope >= 0 by default
+
+# ====== MODEL / FEATURES / ATR SETTINGS (add at end) ======
+
+# Model toggle and path
+USE_MODEL        = env("USE_MODEL", str, "true").lower() == "true"
+MODEL_PATH       = env("MODEL_PATH", str, "models/xgb_target_first.json")
+SCORE_THRESHOLD  = float(env("SCORE_THRESHOLD", float, 0.10))
+
+# How far in the future we label wins (hours), and how many past days to build rows
+HORIZON_HOURS    = int(env("HORIZON_HOURS", int, 168))  # up to 7 days
+FEATURE_DAYS     = int(env("FEATURE_DAYS", int, 90))
+
+# ATR length for volatility-based logic
+ATR_LEN          = int(env("ATR_LEN", int, 14))
+
+# ATR-based stops/targets (Option D)
+USE_ATR_STOPS    = env("USE_ATR_STOPS", str, "true").lower() == "true"
+ATR_STOP_MULT    = float(env("ATR_STOP_MULT", float, 1.8))
+ATR_TARGET_MULT  = float(env("ATR_TARGET_MULT", float, 4.5))
+
+# Trailing with ATR (Option A). We keep your existing % trail too.
+TSL_USE_ATR      = env("TSL_USE_ATR", str, "true").lower() == "true"
+TSL_ATR_MULT     = float(env("TSL_ATR_MULT", float, 3.0))
+# When price reaches the old target, tighten the trail (e.g., 70% of original trail)
+TSL_TIGHTEN_MULT = float(env("TSL_TIGHTEN_MULT", float, 0.7))
+
+# Risk scaling by model score (Option B). 1.0 = no scale. Cap keeps it safe.
+RISK_MAX_MULTIPLIER = float(env("RISK_MAX_MULTIPLIER", float, 1.8))

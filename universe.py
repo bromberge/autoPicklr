@@ -2,14 +2,13 @@
 #
 # Build a dynamic trading universe from Kraken.
 # Rules:
-#  - USD-quoted spot pairs (…USD)
+#  - USD / USDT-quoted spot pairs
 #  - Exclude obvious non-spot/indices/stables
 #  - Rank by 24h USD volume (last price * base_volume_24h)
 #  - Keep top N (configurable)
 #  - Cache results in SQLite so we don’t slam APIs
 
 from __future__ import annotations
-from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -17,12 +16,14 @@ import httpx
 from sqlmodel import SQLModel, Field, Session, select
 
 from settings import (
-    MIN_VOLUME_USD,  # e.g. 20_000_000
-    UNIVERSE_TOP_N,  # e.g. 25
-    UNIVERSE_EXCLUDE,  # list[str]
-    UNIVERSE_INCLUDE,  # list[str]
+    MIN_VOLUME_USD,          # e.g. 1_000_000
+    UNIVERSE_TOP_N,          # e.g. 150
+    UNIVERSE_EXCLUDE,        # list[str]
+    UNIVERSE_INCLUDE,        # list[str]
     UNIVERSE_CACHE_MINUTES,  # e.g. 60
 )
+# We import ALLOWED_QUOTES here to keep quoting logic in one place.
+from settings import ALLOWED_QUOTES
 
 # ---------- Storage table (cached universe) ----------
 class UniversePair(SQLModel, table=True):
@@ -73,8 +74,7 @@ async def _kraken_ticker(pairs: List[str]) -> Dict:
         out_result.update(j.get("result", {}))
     return {"result": out_result}
 
-from settings import ALLOWED_QUOTES
-
+# ---------- Pair helpers ----------
 def _is_usd_pair(pair_info: dict) -> bool:
     ws = pair_info.get("wsname")
     if isinstance(ws, str) and "/" in ws:
@@ -86,7 +86,6 @@ def _is_usd_pair(pair_info: dict) -> bool:
     if quote_raw == "USDT" and "USDT" in ALLOWED_QUOTES:
         return True
     return False
-
 
 def _extract_base_symbol(pair_info: Dict) -> Optional[str]:
     # Use wsname if present (e.g. "BTC/USD" -> "BTC")
@@ -107,7 +106,7 @@ def _extract_base_symbol(pair_info: Dict) -> Optional[str]:
 
 def _extract_pair_key(pair_key: str, pair_info: Dict) -> str:
     """Return the ticker key we must use for /Ticker response mapping."""
-    # Kraken’s Ticker result uses the pair key as returned by AssetPairs keys (e.g. "XXBTZUSD", "XETHZUSD")
+    # Kraken’s Ticker result uses the AssetPairs key (e.g. "XXBTZUSD", "XETHZUSD")
     return pair_key
 
 def _clean_exclusions(sym: str) -> bool:
@@ -120,16 +119,11 @@ def _clean_exclusions(sym: str) -> bool:
         return False
     return True
 
-# --- Auto-refresh helper ---
-from datetime import datetime, timezone, timedelta
-from sqlmodel import select
-from settings import UNIVERSE_CACHE_MINUTES
-
-def universe_stale(session) -> bool:
+# ---------- Universe staleness helper ----------
+def universe_stale(session: Session) -> bool:
     """
     Returns True if the cached universe is empty or older than UNIVERSE_CACHE_MINUTES.
     """
-    from universe import UniversePair  # local import to avoid circulars
     row = session.exec(
         select(UniversePair).order_by(UniversePair.updated_at.desc())
     ).first()
@@ -139,6 +133,85 @@ def universe_stale(session) -> bool:
     age = now - row.updated_at
     return age >= timedelta(minutes=UNIVERSE_CACHE_MINUTES)
 
+# ---------- “Last known good” fallback ----------
+_LAST_GOOD: List[str] = []
+
+# --- Ensure mapping for specific symbols (force-include) ---
+from typing import List
+
+async def ensure_pairs_for(session: Session, symbols: List[str]) -> List[str]:
+    """
+    Ensure UniversePair rows exist for the given base symbols (e.g., ['API3','XMR']).
+    - Looks up USD/USDT Kraken pairs for those bases
+    - Fetches a ticker for price/volume
+    - Inserts rows for any that were missing (ignores min-volume/top-N caps)
+    Returns the list of symbols that were added.
+    """
+    if not symbols:
+        return []
+
+    # Which symbols are missing right now?
+    existing = session.exec(select(UniversePair).where(UniversePair.symbol.in_(symbols))).all()
+    have = {r.symbol for r in existing}
+    need = [s for s in symbols if s not in have]
+    if not need:
+        return []
+
+    # Scan Kraken asset pairs, keep only USD/USDT-quoted
+    pairs_json = await _kraken_asset_pairs()
+    pairs_raw = pairs_json.get("result", {})
+    wanted = {}  # base -> (pair_key, pair_info)
+    for pk, info in pairs_raw.items():
+        if not _is_usd_pair(info):
+            continue
+        base = _extract_base_symbol(info)
+        if base in need and base not in wanted:
+            wanted[base] = (pk, info)
+
+    if not wanted:
+        return []
+
+    # Fetch ticker for the wanted pairs
+    ticker_keys = [pk for pk, _ in wanted.values()]
+    tick_json = await _kraken_ticker(ticker_keys)
+    tick = tick_json.get("result", {})
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    added: List[str] = []
+
+    for base_sym, (pair_key, info) in wanted.items():
+        tk = tick.get(_extract_pair_key(pair_key, info))
+        if not tk:
+            continue
+        close = float(tk["c"][0]) if tk.get("c") else None
+        v_today = float(tk["v"][0]) if tk.get("v") else 0.0
+        v_24h   = float(tk["v"][1]) if tk.get("v") else 0.0
+        vol24 = v_24h if v_24h > 0 else v_today
+        if not close or close <= 0:
+            continue
+
+        ws = info.get("wsname")
+        quote = "USD"
+        if isinstance(ws, str) and "/" in ws:
+            quote = ws.split("/")[-1].upper()
+
+        session.add(UniversePair(
+            symbol=base_sym,
+            pair=pair_key,
+            base=base_sym,
+            quote=quote,
+            price=close,
+            base_vol_24h=vol24,
+            usd_vol_24h=close * vol24,
+            updated_at=now,
+        ))
+        added.append(base_sym)
+
+    if added:
+        session.commit()
+        print(f"[universe] Force-included pairs for open positions: {added}")
+
+    return added
 
 # ---------- Public: refresh & get universe ----------
 async def refresh_universe(session: Session) -> List[UniversePair]:
@@ -172,7 +245,7 @@ async def refresh_universe(session: Session) -> List[UniversePair]:
             continue
         if not _clean_exclusions(base):
             continue
-        # prefer first occurrence; later we could dedup (e.g. "BTC/USD" vs "BTC/USD.m")
+        # prefer first occurrence
         if base not in base_map:
             base_map[base] = (pk, info)
 
@@ -258,19 +331,57 @@ async def refresh_universe(session: Session) -> List[UniversePair]:
     session.commit()
 
     print(f"[universe] Refreshed {len(rows)} USD/USDT pairs from Kraken (min ${MIN_VOLUME_USD:,.0f}, top {UNIVERSE_TOP_N}).")
-    return rows
 
+    # remember latest good symbols
+    global _LAST_GOOD
+    _LAST_GOOD = [r.symbol for r in rows]
+    return rows
 
 def get_active_universe(session: Session) -> List[str]:
     """
-    Return cached universe if fresh; otherwise an empty list (caller may trigger refresh).
+    Return cached universe. If the cache is stale, we still return the current
+    DB rows (so we don't collapse to the static UNIVERSE). Fall back to the last
+    good list, then to settings.UNIVERSE only if the table is empty.
     """
+    global _LAST_GOOD  # <-- declare at the very top of the function
+    from settings import UNIVERSE  # local import to avoid surprises
+
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     rows = session.exec(select(UniversePair).order_by(UniversePair.usd_vol_24h.desc())).all()
+
     if not rows:
-        return []
+        # DB empty: try LAST_GOOD, then settings.UNIVERSE
+        if _LAST_GOOD:
+            print(f"[universe] fallback to LAST_GOOD ({len(_LAST_GOOD)})")
+            return _LAST_GOOD[:]
+        print(f"[universe] fallback to settings.UNIVERSE {UNIVERSE}")
+        return UNIVERSE[:]
+
+    # even if stale, return rows (do NOT return [])
     age = now - rows[0].updated_at
     if age > timedelta(minutes=UNIVERSE_CACHE_MINUTES):
-        # stale -> caller can decide to refresh
-        return []
-    return [r.symbol for r in rows]
+        print(f"[universe] cache is stale by {age}, returning STALE rows (not empty)")
+        syms = [r.symbol for r in rows]
+        _LAST_GOOD = syms[:]
+        return syms
+
+    syms = [r.symbol for r in rows]
+    _LAST_GOOD = syms[:]
+    return syms
+
+# ---------- Optional: debug snapshot ----------
+def universe_debug_snapshot(session: Session) -> dict:
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=UNIVERSE_CACHE_MINUTES)
+    all_rows = session.exec(select(UniversePair)).all()
+    fresh = [r for r in all_rows if r.updated_at >= cutoff]
+    quote_ok = [r for r in all_rows if (r.quote or "").upper() in ALLOWED_QUOTES]
+    vol_ok = [r for r in quote_ok if float(r.usd_vol_24h or 0.0) >= float(MIN_VOLUME_USD)]
+    return {
+        "rows_total": len(all_rows),
+        "rows_fresh": len(fresh),
+        "quote_ok": len(quote_ok),
+        "vol_ok": len(vol_ok),
+        "top_n": UNIVERSE_TOP_N,
+        "cache_minutes": UNIVERSE_CACHE_MINUTES,
+        "last_good": len(_LAST_GOOD),
+    }
