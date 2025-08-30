@@ -103,8 +103,8 @@ MAX_NEW_POSITIONS_PER_CYCLE = int(env("MAX_NEW_POSITIONS_PER_CYCLE", int, 2))
 SIGNAL_MIN_NOTIONAL_USD = float(env("SIGNAL_MIN_NOTIONAL_USD", float, 10.0))
 
 # Quality filters (env-backed)
-MAX_EXTENSION_PCT   = float(env("MAX_EXTENSION_PCT", float, 0.03))
-MIN_RR              = float(env("MIN_RR", float, 2.0))
+MAX_EXTENSION_PCT   = float(env("MAX_EXTENSION_PCT", float, 0.08))
+MIN_RR              = float(env("MIN_RR", float, 1.5))
 EMA_SLOPE_LOOKBACK  = int(env("EMA_SLOPE_LOOKBACK", int, 5))
 
 # Debug
@@ -141,3 +141,13 @@ TSL_TIGHTEN_MULT = float(env("TSL_TIGHTEN_MULT", float, 0.7))
 
 # Risk scaling by model score (Option B). 1.0 = no scale. Cap keeps it safe.
 RISK_MAX_MULTIPLIER = float(env("RISK_MAX_MULTIPLIER", float, 1.8))
+
+BROKER = env("BROKER", str, "sim")
+
+KRAKEN_API_KEY    = env("KRAKEN_API_KEY", str, "")
+KRAKEN_API_SECRET = env("KRAKEN_API_SECRET", str, "")
+
+LIVE_MAX_ORDER_USD = float(env("LIVE_MAX_ORDER_USD", float, 50.0))
+LIVE_MIN_ORDER_USD = float(env("LIVE_MIN_ORDER_USD", float, 5.0))
+
+

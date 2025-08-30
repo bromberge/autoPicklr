@@ -49,6 +49,14 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def _is_live_broker(broker) -> bool:
+    """
+    We consider 'live' if broker.paper == False.
+    Your SimBroker uses paper=True; KrakenLiveBroker uses paper=False.
+    """
+    return bool(broker) and (not getattr(broker, "paper", True))
+
+
 # --------------------------
 # Wallet helpers
 # --------------------------
@@ -398,7 +406,7 @@ def refresh_position_stats(session: Session, p: M.Position):
 # --------------------------
 # MTM + full position management
 # --------------------------
-def mark_to_market_and_manage(session: Session):
+def mark_to_market_and_manage(session: Session, broker=None):
     """
     Every cycle: manage TP1/TP2, Break-even, Trailing, Stop/Target, and Time exit.
     """
@@ -422,18 +430,44 @@ def mark_to_market_and_manage(session: Session):
 
         # ---- Partial Take-Profits ----
         tp_levels = [entry_px * (1 + g) for g in PTP_LEVELS]
+        tp_price1 = tp_levels[0] if len(tp_levels) >= 1 else None
+        tp_price2 = tp_levels[1] if len(tp_levels) >= 2 else None
 
-        if not p.tp1_done and len(tp_levels) >= 1 and last_px >= tp_levels[0]:
-            sell_qty = p.qty * min(1.0, PTP_SIZES[0] if PTP_SIZES else 0.0)
+        # TP1
+        if (not p.tp1_done) and (tp_price1 is not None) and (last_px >= tp_price1):
+            sell_qty = p.qty * (PTP_SIZES[0] if PTP_SIZES and len(PTP_SIZES) >= 1 else 0.0)
             if sell_qty > 0:
-                _partial_close(session, p, sell_qty, tp_levels[0], "TP1")
-                p.tp1_done = True
+                if _is_live_broker(broker):
+                    res = broker.place_order(
+                        symbol=p.symbol, side="SELL", qty=sell_qty,
+                        order_type="market", price=tp_price1,
+                        reason="TP1", session=session,
+                    )
+                    if res:
+                        p.tp1_done = True
+                else:
+                    _partial_close(session, p, sell_qty, tp_price1, "TP1")
+                    p.tp1_done = True
 
-        if p.status == "OPEN" and not p.tp2_done and len(tp_levels) >= 2 and last_px >= tp_levels[1]:
-            sell_qty = p.qty * min(1.0, PTP_SIZES[1] if len(PTP_SIZES) >= 2 else 0.0)
+        # TP2
+        if p.status == "OPEN" and (not p.tp2_done) and (tp_price2 is not None) and (last_px >= tp_price2):
+            sell_qty = p.qty * (PTP_SIZES[1] if PTP_SIZES and len(PTP_SIZES) >= 2 else 0.0)
             if sell_qty > 0:
-                _partial_close(session, p, sell_qty, tp_levels[1], "TP2")
-                p.tp2_done = True
+                if _is_live_broker(broker):
+                    res = broker.place_order(
+                        symbol=p.symbol,
+                        side="SELL",
+                        qty=sell_qty,
+                        order_type="market",
+                        price=tp_price2,
+                        reason="TP2",
+                        session=session,
+                    )
+                    if res:
+                        p.tp2_done = True
+                else:
+                    _partial_close(session, p, sell_qty, tp_price2, "TP2")
+                    p.tp2_done = True
 
         if p.status != "OPEN":
             continue
@@ -477,7 +511,14 @@ def mark_to_market_and_manage(session: Session):
         if p.qty > 0:
             # A) Hard stop (or trailing stop)
             if last_px <= p.stop:
-                _close_position(session, p, p.stop, "STOP/TSL")
+                if _is_live_broker(broker):
+                    broker.place_order(
+                        symbol=p.symbol, side="SELL", qty=p.qty,
+                        order_type="market", price=p.stop,
+                        reason="STOP/TSL", session=session,
+                    )
+                else:
+                    _close_position(session, p, p.stop, "STOP/TSL")
                 continue
 
             # B) Reaching the old target does NOT close the trade.
@@ -509,7 +550,14 @@ def mark_to_market_and_manage(session: Session):
         if p.status == "OPEN" and p.opened_ts is not None:
             age = (_utcnow() - p.opened_ts)
             if age >= timedelta(minutes=MAX_HOLD_MINUTES):
-                _close_position(session, p, last_px, "TIME")
+                if _is_live_broker(broker):
+                    broker.place_order(
+                        symbol=p.symbol, side="SELL", qty=p.qty,
+                        order_type="market", price=last_px,
+                        reason="TIME", session=session,
+                    )
+                else:
+                    _close_position(session, p, last_px, "TIME")
                 continue
 
     # refresh stats for all remaining open positions

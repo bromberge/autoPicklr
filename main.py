@@ -2,19 +2,26 @@
 
 import asyncio
 import contextlib
+import os, time
+import ccxt
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from universe import universe_stale, universe_debug_snapshot
 from universe import refresh_universe, get_active_universe, ensure_pairs_for, UniversePair
-
-import os
+from collections import defaultdict
+from flask import jsonify, request
 from fastapi import FastAPI, Request, Query
+from fastapi import HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from jinja2 import Template  # optional; safe to keep
 from sqlmodel import SQLModel, create_engine, Session, select
 from sqlalchemy import text
+from typing import Optional
+import traceback
+from dotenv import load_dotenv 
+load_dotenv(override=False)
 
 # --- settings & models ---
 from settings import (
@@ -30,8 +37,6 @@ from settings import (
     USE_MODEL, SCORE_THRESHOLD, ENABLE_DEBUG_SIGNALS,
 )
 from settings import POLL_SECONDS, UNIVERSE_REFRESH_MINUTES, UNIVERSE
-
-
 from models import Wallet, Order, Position, Trade, Candle
 
 # signals
@@ -41,7 +46,6 @@ from signal_engine import compute_signals
 from sim import (
     ensure_wallet,
     can_open_new_position,
-    place_buy,
     mark_to_market_and_manage,
     get_last_price,
 )
@@ -53,12 +57,59 @@ from risk import size_position as risk_size_position
 from universe import refresh_universe, get_active_universe
 from data import update_candles_for
 
+# paperPicklr Starts Here:
+from brokers import make_broker
+
+BROKER_HANDLE = None  # set during startup
+
+# ======= Kraken (ccxt) single-instance and utils for /api/account_v2 =======
+EXCHANGE = None  # lazy init to avoid changing your startup flow
+
+def _get_exchange():
+    global EXCHANGE
+    if EXCHANGE is not None:
+        return EXCHANGE
+    api_key = os.environ.get("KRAKEN_API_KEY", "")
+    secret  = os.environ.get("KRAKEN_API_SECRET", "")
+    ex = ccxt.kraken({
+        "apiKey": api_key,
+        "secret": secret,
+        "enableRateLimit": True,
+    })
+    ex.load_markets()
+    EXCHANGE = ex
+    return EXCHANGE
+
+def _fnum(x):
+    try: return float(x)
+    except: return 0.0
+
+def _norm_asset(a: str) -> str:
+    # ccxt usually normalizes, but guard against Kraken raw codes
+    return {"XBT":"BTC", "ZUSD":"USD"}.get(a, a)
+
+def _usd_sym(asset: str) -> str:
+    return f"{_norm_asset(asset)}/USD"
+
+def _mid_price(t):
+    bid = _fnum(t.get("bid"))
+    ask = _fnum(t.get("ask"))
+    last = _fnum(t.get("last"))
+    close = _fnum(t.get("close"))
+    if bid and ask:
+        return (bid + ask) / 2.0
+    return last or close or 0.0
+# ========================================================================== 
+
+ACCOUNT_BASELINE = float(os.environ.get("LIVE_BASELINE_EQUITY", "0") or 0.0)
+
 # ---- engine/app ----
 engine = create_engine(
     "sqlite:///picklr.db",
     echo=False,
     connect_args={"check_same_thread": False},
 )
+
 
 def _column_missing(conn, table: str, col: str) -> bool:
     info = conn.execute(text(f"PRAGMA table_info('{table}')")).fetchall()
@@ -187,6 +238,131 @@ def _eval_candidate(session, w, sym, sig) -> dict:
         "rr": rr,
     }
 
+# --- Reconcile local DB OPEN positions with live Kraken balances/trades ---
+from typing import Optional
+def _extract_base(symbol: str) -> str:
+    # "AAVE/USD" -> "AAVE"
+    return (symbol or "").split("/")[0].strip()
+
+def _mid_from_ticker(ex, symbol: str) -> float:
+    try:
+        t = ex.fetch_ticker(symbol)
+        b = float(t.get("bid") or 0); a = float(t.get("ask") or 0); last = float(t.get("last") or 0)
+        return (b+a)/2 if b and a else (last or float(t.get("close") or 0) or 0.0)
+    except Exception:
+        return 0.0
+
+def reconcile_spot_positions(session):
+    """
+    For each OPEN Position in DB:
+      - Look at Kraken total balance of base asset.
+      - If holding < dust => fully close locally at current price (or recent sell).
+      - If holding < DB qty but > dust => reduce the DB qty and realize partial trade.
+    This keeps the local truth aligned when user sells directly on exchange.
+    """
+    try:
+        ex = _get_exchange()   # from earlier /api/account_v2 helpers
+    except Exception as e:
+        print(f"[reconcile] cannot init exchange: {e}")
+        return
+
+    dust = float(os.environ.get("POSITION_DUST_USD", "0.01"))
+
+    # 1) pull balances
+    try:
+        bal = ex.fetch_balance() or {}
+        total = bal.get("total", {}) or {}
+    except Exception as e:
+        print(f"[reconcile] fetch_balance failed: {e}")
+        return
+
+    # helper to get current USD value of a qty for a symbol
+    def _usd_value(sym: str, qty: float) -> float:
+        px = _mid_from_ticker(ex, sym)
+        return (px * float(qty or 0.0), px)
+
+    open_rows = session.exec(select(Position).where(Position.status == "OPEN")).all()
+    if not open_rows:
+        return
+
+    for p in open_rows:
+        base = _extract_base(p.symbol)
+        # Kraken raw may be XBT/Z... but ccxt usually normalizes; keep a small alias
+        base_alias = {"XBT":"BTC","ZUSD":"USD"}.get(base, base)
+
+        held_qty = float(total.get(base_alias) or total.get(base) or 0.0)
+        db_qty   = float(getattr(p, "qty", 0.0) or 0.0)
+
+        if db_qty <= 0:
+            # nothing to reconcile
+            continue
+
+        # current USD value of what's still in DB
+        val_db, px_now = _usd_value(p.symbol, db_qty)
+
+        # 2) Fully closed on exchange (or dust only)
+        if held_qty <= 0:
+            # If the remaining USD value is tiny, just close locally at px_now
+            if val_db <= dust or px_now <= 0:
+                # realize full PnL using current price
+                entry_px = float(p.avg_price or 0.0)
+                exit_px  = px_now or entry_px
+                qty      = db_qty
+                pnl_usd  = (exit_px - entry_px) * qty
+
+                # create Trade row
+                tr = Trade(
+                    symbol=p.symbol,
+                    entry_ts=p.opened_ts,
+                    exit_ts=datetime.utcnow(),
+                    entry_px=entry_px,
+                    exit_px=exit_px,
+                    qty=qty,
+                    pnl_usd=pnl_usd,
+                    result=("WIN" if pnl_usd > 0 else "LOSS" if pnl_usd < 0 else "EVEN"),
+                )
+                session.add(tr)
+
+                # mark position closed
+                p.status = "CLOSED"
+                p.current_px = px_now
+                p.pl_usd = pnl_usd
+                p.pl_pct = ((exit_px/entry_px - 1.0) * 100.0) if entry_px else 0.0
+                session.commit()
+                print(f"[reconcile] Closed locally {p.symbol} qty={qty} (sold on exchange)")
+                continue
+
+        # 3) Partial close on exchange (held < DB qty)
+        if 0 < held_qty < db_qty:
+            closed_qty = db_qty - held_qty
+            exit_px    = px_now or float(p.avg_price or 0.0)
+            entry_px   = float(p.avg_price or 0.0)
+            pnl_usd    = (exit_px - entry_px) * closed_qty
+
+            # realize partial trade
+            tr = Trade(
+                symbol=p.symbol,
+                entry_ts=p.opened_ts,
+                exit_ts=datetime.utcnow(),
+                entry_px=entry_px,
+                exit_px=exit_px,
+                qty=closed_qty,
+                pnl_usd=pnl_usd,
+                result=("WIN" if pnl_usd > 0 else "LOSS" if pnl_usd < 0 else "EVEN"),
+            )
+            session.add(tr)
+
+            # shrink the open position to held_qty
+            p.qty = held_qty
+            p.current_px = px_now
+            # recompute running PL on the remainder
+            p.pl_usd = (px_now - entry_px) * held_qty
+            p.pl_pct = ((px_now/entry_px - 1.0) * 100.0) if entry_px else 0.0
+            session.commit()
+            print(f"[reconcile] Partial reduce {p.symbol}: -{closed_qty}, keep {held_qty}")
+            continue
+
+        # 4) Nothing to do (held >= db_qty) — either equal or you bought more elsewhere (let your strategy handle)
 
 
 def migrate_db(engine):
@@ -241,9 +417,23 @@ RUN_ENABLED = True
 # -------- lifespan (startup/shutdown) --------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global BROKER_HANDLE  # <-- single global at the very top
     print("Starting autoPicklr Trading Simulator...")
-    # Create tables + wallet
+
+    # Create tables
     SQLModel.metadata.create_all(engine)
+
+    # Initialize the broker once
+    BROKER_HANDLE = make_broker(engine)
+    print(f"[startup] Broker initialized: {BROKER_HANDLE.name} (paper={getattr(BROKER_HANDLE, 'paper', None)})")
+
+    # Optional: show starting balances
+    try:
+        bal = BROKER_HANDLE.get_balance()
+        print(f"[startup] Balance: cash=${bal.cash_usd:,.2f}, equity=${bal.equity_usd:,.2f}")
+    except Exception as e:
+        print(f"[startup] Could not fetch broker balance: {e}")
+
     print("[startup] Ensuring wallet exists...")
     with Session(engine) as s:
         ensure_wallet(s)
@@ -257,6 +447,7 @@ async def lifespan(app: FastAPI):
         print("[startup] Refreshing universe once...")
         # Warm the universe cache so the first loop has data
         await refresh_universe(s)
+
     print("[startup] Starting trading loop...")
     loop_task = asyncio.create_task(trading_loop())
     print("[startup] Startup complete!")
@@ -266,6 +457,7 @@ async def lifespan(app: FastAPI):
         loop_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await loop_task
+
 
 
 app = FastAPI(title="autoPicklr Trading Simulator", lifespan=lifespan)
@@ -279,6 +471,17 @@ templates = Jinja2Templates(directory="templates")
 # ---- Routes ----
 from fastapi import APIRouter
 admin = APIRouter()
+
+@app.get("/api/broker")
+def api_broker():
+    h = BROKER_HANDLE
+    bal = h.get_balance()
+    return {
+        "broker": getattr(h, "name", "unknown"),
+        "paper": getattr(h, "paper", True),
+        "cash_usd": getattr(bal, "cash_usd", 0.0),
+        "equity_usd": getattr(bal, "equity_usd", 0.0),
+    }
 
 @app.get("/admin/next_signals")
 def admin_next_signals(limit: int = Query(15, ge=1, le=200)):
@@ -480,9 +683,33 @@ def profit_protection_summary():
 @app.get("/api/trades")
 def trades():
     with Session(engine) as s:
-        xs = s.exec(select(Trade).order_by(Trade.id.desc())).all()[:200]
-        return [
-            {
+        # last 200 closed trades
+        xs = s.exec(select(Trade).where(Trade.exit_ts.is_not(None))
+                    .order_by(Trade.exit_ts.desc())).all()[:200]
+
+        # pull recent SELL orders to infer reasons (TP1/TP2/STOP/TSL/TIME, etc.)
+        sell_orders = s.exec(
+            select(Order)
+            .where(Order.side == "SELL", Order.status == "FILLED")
+            .order_by(Order.ts.desc())
+        ).all()
+
+        def find_reason(sym, exit_ts):
+            if not exit_ts:
+                return None
+            # best-effort: first SELL for same symbol within ±10 minutes of exit
+            for o in sell_orders:
+                if o.symbol != sym:
+                    continue
+                dt = abs((exit_ts - o.ts).total_seconds())
+                if dt <= 600:   # 10 minutes
+                    return o.reason
+            return None
+
+        out = []
+        for x in xs:
+            reason = find_reason(x.symbol, x.exit_ts)
+            out.append({
                 "id": x.id,
                 "symbol": x.symbol,
                 "entry_ts": x.entry_ts.isoformat() if x.entry_ts else None,
@@ -491,9 +718,177 @@ def trades():
                 "exit_px": x.exit_px,
                 "qty": x.qty,
                 "pnl_usd": x.pnl_usd,
-                "result": x.result
-            } for x in xs
-        ]
+                "result": x.result,
+                "reason": reason,
+            })
+        return out
+
+@app.get("/api/account")
+def api_account():
+    global ACCOUNT_BASELINE
+    with Session(engine) as s:
+        pos = s.exec(select(Position).where(Position.status == "OPEN")).all()
+        mv = 0.0
+        for p in pos:
+            c = s.exec(select(Candle).where(Candle.symbol == p.symbol).order_by(Candle.ts.desc())).first()
+            last = float(c.close) if c else float(p.avg_price or 0.0)
+            mv += last * float(p.qty or 0.0)
+
+    bal = BROKER_HANDLE.get_balance() if BROKER_HANDLE else None
+    cash = float(getattr(bal, "cash_usd", 0.0))
+    equity = float(getattr(bal, "equity_usd", 0.0)) or (cash + mv)
+
+    # initialize baseline once (or set LIVE_BASELINE_EQUITY in env to force a value)
+    if ACCOUNT_BASELINE <= 0 and equity > 0:
+        ACCOUNT_BASELINE = equity
+
+    exposure_pct = (mv / equity * 100.0) if equity > 0 else 0.0
+    lifetime_pl_pct = ((equity - ACCOUNT_BASELINE) / ACCOUNT_BASELINE * 100.0) if ACCOUNT_BASELINE > 0 else 0.0
+
+    return {
+        "cash": cash,
+        "equity": equity,
+        "positions": len(pos),
+        "exposure_pct": exposure_pct,
+        "lifetime_pl_pct": lifetime_pl_pct,
+        "mode": "LIVE (Kraken)",
+    }
+
+@app.get("/api/account_v2")
+def api_account_v2(lookback_days: int = 7, symbols: Optional[str] = None):
+    """
+    Unified live account snapshot from Kraken (ccxt):
+      - cash_usd: free USD
+      - positions: non-USD holdings with USD price & value
+      - trades: per-symbol aggregates (avg_buy, buy_qty, avg_sell, sell_qty, realized_pnl)
+      - equity_usd: cash + positions value + realized_pnl (per your spec)
+    """
+    try:
+        print("[/api/account_v2] hit", lookback_days, symbols)  # keep this
+        ex = _get_exchange()
+
+        # ---------- balances ----------
+        bal   = ex.fetch_balance() or {}
+        free  = bal.get("free", {}) or {}
+        total = bal.get("total", {}) or {}
+
+        usd_free = _fnum(free.get("USD", free.get("ZUSD", 0.0)))
+
+        # ---------- positions (non-USD) ----------
+        positions = []
+        assets = { _norm_asset(a): _fnum(q) for a, q in total.items() if _fnum(q) > 0 }
+        assets.pop("USD", None)
+
+        prices = {}
+        pos_value_sum = 0.0
+        for asset, qty in assets.items():
+            sym = _usd_sym(asset)
+            try:
+                t = ex.fetch_ticker(sym)
+                px = _mid_price(t)
+            except Exception:
+                px = 0.0
+            prices[sym] = px
+            val = qty * px
+            # Ignore dust positions under $0.01 (configurable)
+            dust = float(os.environ.get("POSITION_DUST_USD", "0.01"))
+            if val >= dust:
+                pos_value_sum += val
+                positions.append({
+                    "asset": asset,
+                    "symbol": sym,
+                    "qty": qty,
+                    "price_usd": px,
+                    "value_usd": val,
+                })
+
+
+        # ---------- trades aggregation ----------
+        import time
+        from collections import defaultdict
+        since_ms = int(time.time()*1000) - int(lookback_days)*24*60*60*1000
+
+        if symbols:
+            wanted = [s.strip() for s in symbols.split(",") if s.strip()]
+        else:
+            prefer = [_usd_sym(a) for a in assets.keys()]
+            fallback = ["PAXG/USD","BTC/USD","ETH/USD","AAVE/USD","SOL/USD"]
+            wanted = [s for i,s in enumerate(prefer + fallback) if s in ex.markets and s not in (prefer + fallback)[:i]]
+            if not wanted:
+                wanted = [m for m in ex.markets if m.endswith("/USD")][:10]
+
+        agg = defaultdict(lambda: {"buy_qty":0.0,"buy_notional":0.0,"sell_qty":0.0,"sell_notional":0.0})
+        for sym in wanted:
+            try:
+                tr = ex.fetch_my_trades(sym, since_ms, limit=500) or []
+                for t in tr:
+                    side = t.get("side")
+                    qty  = _fnum(t.get("amount"))
+                    px   = _fnum(t.get("price"))
+                    if qty <= 0 or px <= 0:
+                        continue
+                    notional = qty * px
+                    if side == "buy":
+                        agg[sym]["buy_qty"]      += qty
+                        agg[sym]["buy_notional"] += notional
+                    elif side == "sell":
+                        agg[sym]["sell_qty"]      += qty
+                        agg[sym]["sell_notional"] += notional
+            except Exception as ee:
+                print(f"[/api/account_v2] fetch_my_trades failed for {sym}: {ee}")
+
+        trades = []
+        realized_pnl = 0.0
+        for sym, a in agg.items():
+            bq, bN = a["buy_qty"],  a["buy_notional"]
+            sq, sN = a["sell_qty"], a["sell_notional"]
+            avg_buy  = (bN/bq) if bq>0 else 0.0
+            avg_sell = (sN/sq) if sq>0 else 0.0
+            matched_qty = min(bq, sq)
+            pnl_sym = matched_qty * (avg_sell - avg_buy)
+            realized_pnl += pnl_sym
+            trades.append({
+                "symbol": sym,
+                "avg_buy": avg_buy,
+                "buy_qty": bq,
+                "avg_sell": avg_sell,
+                "sell_qty": sq,
+                "realized_pnl": pnl_sym,
+            })
+
+        equity = usd_free + pos_value_sum + realized_pnl
+
+        return {
+            "cash_usd": usd_free,
+            "equity_usd": equity,
+            "positions": positions,
+            "trades": trades,
+            "realized_pnl_window": realized_pnl,
+            "prices": prices,
+            "lookback_days": lookback_days,
+        }
+
+    except Exception as e:
+        print("[/api/account_v2] ERROR:", e)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+@app.get("/api/open_orders")
+def api_open_orders():
+    try:
+        if BROKER_HANDLE and hasattr(BROKER_HANDLE, "fetch_open_orders"):
+            return BROKER_HANDLE.fetch_open_orders()
+    except Exception as e:
+        print(f"[api] open_orders failed: {e}")
+
+    # Fallback to DB non-filled orders if exchange returns nothing
+    with Session(engine) as s:
+        xs = s.exec(select(Order).where(Order.status != "FILLED").order_by(Order.id.desc())).all()[:20]
+        return [{"time": x.ts.isoformat(), "symbol": x.symbol, "side": x.side,
+                 "price": x.price_req, "status": x.status} for x in xs]
+
 
 @app.get("/api/wallet")
 def wallet():
@@ -547,8 +942,10 @@ def performance():
 
         return {
             "equity_curve": curve,
-            "current_equity": now_equity
+            "current_equity": now_equity,
+            "start_equity": start,          
         }
+
 
 def _open_position_symbols(session):
     rows = session.exec(select(Position).where(Position.status == "OPEN")).all()
@@ -589,6 +986,19 @@ async def trading_loop():
                         LAST_UNIVERSE_REFRESH = now
 
                     # --- end universe refresh ---
+
+                    # --- sync the DB wallet from the live broker each loop ---
+                    try:
+                        kr = BROKER_HANDLE.get_balance()  # should return object with cash_usd, equity_usd
+                        w = s.get(Wallet, 1)
+                        if w:
+                            # Treat cash_usd as free quote balance; equity_usd as total portfolio value
+                            w.balance_usd = float(getattr(kr, "cash_usd", w.balance_usd))
+                            w.equity_usd  = float(getattr(kr, "equity_usd", w.equity_usd))
+                            s.commit()
+                    except Exception as e:
+                        print(f"[wallet-sync] failed: {e}")
+
                     
                     # --- always keep candles fresh for *open positions* (every 60s) ---
                     global LAST_OPEN_POS_UPDATE
@@ -645,8 +1055,10 @@ async def trading_loop():
 
 
                     # 3) Manage open positions (TPs, BE, TSL, stops, targets, timeouts)
+                    reconcile_spot_positions(s)
                     print("[loop] Managing positions...")
-                    mark_to_market_and_manage(s)
+                    mark_to_market_and_manage(s, broker=BROKER_HANDLE)
+
 
                     # 4) Look for new entries (ranked; place at most N per cycle)
                     print("[loop] Checking for new positions...")
@@ -757,7 +1169,9 @@ async def trading_loop():
                                 continue
 
                             # --- Sizing & notional pre-check (use equity) ---
-                            qty_est = risk_size_position(w.equity_usd, price, sig.stop)
+                            risk_base = w.equity_usd if getattr(BROKER_HANDLE, "paper", True) else (w.balance_usd or 0.0)
+                            qty_est = risk_size_position(risk_base, price, sig.stop)
+
                             if qty_est <= 0:
                                 if ENABLE_DEBUG_SIGNALS:
                                     print(f"[gate:{sym}] size=0 (risk cap or invalid stop)")
@@ -823,12 +1237,24 @@ async def trading_loop():
                             w = s.get(Wallet, 1)
                             if not w:
                                 break
-                            qty = risk_size_position(w.equity_usd, sig.entry, sig.stop)
+                            risk_base = w.equity_usd if getattr(BROKER_HANDLE, "paper", True) else (w.balance_usd or 0.0)
+                            qty = risk_size_position(risk_base, sig.entry, sig.stop)
+
                             if qty <= 0:
                                 continue
             
                             print(f"[loop] Placing buy {sym} score={c['score']:.2f} brk={c['brk']:.4f} rel={c['rel']:.4f}")
-                            place_buy(s, sym, qty, sig.entry, sig.reason, score=c["score"])
+                            # Use the broker abstraction (sim or paper) — reuse the same DB session
+                            _ = BROKER_HANDLE.place_order(
+                                symbol=sym,
+                                side="BUY",
+                                qty=qty,
+                                order_type="market",
+                                price=sig.entry,
+                                reason=sig.reason,
+                                score=c["score"],
+                                session=s,           # IMPORTANT: reuse current session
+                            )
                             placed += 1
             
             else:

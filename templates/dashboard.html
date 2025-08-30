@@ -1,310 +1,207 @@
-<!DOCTYPE html>
-<html lang="en" data-bs-theme="dark">
+<!doctype html>
+<html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>autoPicklr – Trading Simulator</title>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>autoPicklr</title>
 
-  <!-- Bootstrap (dark) + Icons -->
-  <link href="https://cdn.replit.com/agent/bootstrap-agent-dark-theme.min.css" rel="stylesheet">
-  <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-
-  <style>
-    /* --- cyberpunk vibe --- */
-    body {
-      background: radial-gradient(1200px 800px at 20% 0%, rgba(147, 51, 234, 0.35), transparent 60%),
-                  radial-gradient(1200px 800px at 90% 20%, rgba(59, 130, 246, 0.25), transparent 60%),
-                  #0b0d12;
-      min-height: 100vh;
-    }
-    .navbar {
-      background: linear-gradient(90deg, #7c3aed 0%, #2563eb 100%) !important;
-      box-shadow: 0 0 24px rgba(124, 58, 237, .35);
-    }
-    .navbar-brand {
-      text-shadow: 0 0 10px rgba(255,255,255,.35);
-      letter-spacing: .5px;
-    }
-    .metric-card {
-      border: 1px solid rgba(124, 58, 237, .2);
-      background: linear-gradient(180deg, rgba(20,22,32,.85) 0%, rgba(16,18,26,.85) 100%);
-      box-shadow: 0 0 24px rgba(124, 58, 237, .08);
-      transition: transform .18s ease;
-    }
-    .metric-card:hover { transform: translateY(-3px); }
-    .metric-title { color: #94a3b8; font-size: .8rem; letter-spacing: .08em; text-transform: uppercase; }
-    .glow {
-      text-shadow: 0 0 12px rgba(124, 58, 237, .5), 0 0 22px rgba(37, 99, 235, .35);
-    }
-    .card.bg-secondary {
-      border: 1px solid rgba(124, 58, 237, .15);
-      background: rgba(16, 18, 26, .9) !important;
-      box-shadow: inset 0 0 0 1px rgba(37, 99, 235, .06);
-    }
-    .table-dark th { color: #9ca3af; font-weight: 600; }
-    .pill {
-      display:inline-block; padding:.25rem .5rem; border-radius:999px; font-size:.75rem;
-      background: rgba(124,58,237,.15); border:1px solid rgba(124,58,237,.25); color:#c4b5fd;
-    }
-    .pill-green { background: rgba(34,197,94,.12); border-color: rgba(34,197,94,.25); color:#86efac; }
-    .pill-red   { background: rgba(239,68,68,.12); border-color: rgba(239,68,68,.25); color:#fca5a5; }
-    .pill-blue  { background: rgba(59,130,246,.12); border-color: rgba(59,130,246,.25); color:#93c5fd; }
-    .status-indicator {
-      width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:8px;background:#22c55e; box-shadow:0 0 12px rgba(34,197,94,.6);
-    }
-    .refresh-btn {
-      position: fixed; right: 20px; bottom: 20px; z-index: 1000;
-      box-shadow: 0 0 16px rgba(124,58,237,.4);
-    }
-    .text-up   { color:#22c55e; }
-    .text-down { color:#ef4444; }
-    /* cyberpunk accents */
-    :root {
-      --neon-green: #00ff9c;
-      --neon-pink: #ff00e6;
-      --neon-cyan: #00eaff;
-      --neon-amber: #ffd166;
-    }
-
-    body.bg-dark {
-      background:
-        radial-gradient(1200px 800px at 20% -20%, rgba(255,0,200,0.08), transparent 60%),
-        radial-gradient(1000px 700px at 120% 0%, rgba(0,255,180,0.05), transparent 50%),
-        #0b0f14;
-    }
-
-    .table-neon thead th {
-      border-bottom: 2px solid rgba(255,255,255,0.08);
-      text-transform: uppercase;
-      letter-spacing: .06em;
-      font-size: 0.8rem;
-      color: #b8c7d2;
-    }
-
-    .neon-pos { text-shadow: 0 0 8px rgba(0,255,156,0.5); color: var(--neon-green) !important; }
-    .neon-neg { text-shadow: 0 0 8px rgba(255,0,120,0.45); color: var(--neon-pink)  !important; }
-
-    .badge-conf {
-      background: linear-gradient(90deg, rgba(0,255,156,0.15), rgba(0,234,255,0.15));
-      border: 1px solid rgba(0,255,156,0.3);
-      color: #c9ffef;
-      font-weight: 600;
-      text-shadow: 0 0 6px rgba(0,255,156,0.35);
-    }
-
-    .row-glow:hover {
-      background: rgba(0,234,255,0.06) !important;
-      box-shadow: inset 0 0 0 1px rgba(0,234,255,0.12);
-    }
-
-    .card.bg-secondary {
-      background: linear-gradient(180deg, rgba(20,26,33,0.9), rgba(16,20,26,0.95));
-      border: 1px solid rgba(0,234,255,0.12);
-      box-shadow: 0 0 24px rgba(0,234,255,0.08);
-    }
-
-  </style>
+  <!-- Display + mono (numbers) -->
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/dashboard.css"/>
 </head>
+<body class="theme-dark">
+  <div class="page">
 
-<body class="bg-dark">
-  <!-- Nav -->
-  <nav class="navbar navbar-expand-lg navbar-dark">
-    <div class="container">
-      <a class="navbar-brand fw-bold" href="/">
-        <i class="fas fa-bolt me-2"></i>autoPicklr
-      </a>
-      <span class="navbar-text">
-        <span class="status-indicator"></span>
-        Trading Simulator Active
-      </span>
-    </div>
-  </nav>
-
-  <div class="container mt-4">
-
-    <!-- Metrics -->
-    <div class="row g-3 mb-4">
-      <div class="col-md-3">
-        <div class="card metric-card h-100">
-          <div class="card-body text-center">
-            <i class="fas fa-wallet fa-2x text-primary mb-2"></i>
-            <div class="metric-title">Portfolio Value</div>
-            <div id="portfolio-value" class="h3 mb-0 glow">$0.00</div>
-          </div>
-        </div>
+    <!-- ABSTRACT BLADE-RUNNER-STYLE MARGINS -->
+    <div class="bg-city" aria-hidden="true">
+      <div class="side left">
+        <div class="wash"></div>
+        <div class="streaks"></div>
       </div>
-      <div class="col-md-3">
-        <div class="card metric-card h-100">
-          <div class="card-body text-center">
-            <i class="fas fa-sack-dollar fa-2x text-success mb-2"></i>
-            <div class="metric-title">Total P&amp;L</div>
-            <div id="total-pnl" class="h3 mb-0">$0.00</div>
-          </div>
-        </div>
+      <div class="side right">
+        <div class="wash"></div>
+        <div class="streaks"></div>
       </div>
-      <div class="col-md-3">
-        <div class="card metric-card h-100">
-          <div class="card-body text-center">
-            <i class="fas fa-bullseye fa-2x text-info mb-2"></i>
-            <div class="metric-title">Win Rate</div>
-            <div id="win-rate" class="h3 mb-0">0%</div>
-          </div>
-        </div>
-      </div>
-      <div class="col-md-3">
-        <div class="card metric-card h-100">
-          <div class="card-body text-center">
-            <i class="fas fa-layer-group fa-2x text-warning mb-2"></i>
-            <div class="metric-title">Open Positions</div>
-            <div id="open-positions" class="h3 mb-0">0</div>
-          </div>
-        </div>
-      </div>
+      <div class="grain"></div>
     </div>
 
-    <!-- Equity Curve -->
-    <div class="row mb-4">
-      <div class="col-12">
-        <div class="card bg-secondary">
-          <div class="card-header d-flex align-items-center">
-            <h5 class="mb-0"><i class="fas fa-chart-area me-2"></i>Equity Curve</h5>
-          </div>
-          <div class="card-body">
-            <canvas id="equityChart" height="100"></canvas>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Open Positions + Recent Trades -->
-    <div class="row mb-4 g-3">
-      <div class="col-md-7">
-        <div class="card bg-secondary h-100">
-          <div class="card-header d-flex justify-content-between align-items-center">
-            <h5 class="mb-0"><i class="fas fa-coins me-2"></i>Open Positions</h5>
-            <span class="pill-blue">Live</span>
-          </div>
-          <div class="card-body">
-            <div class="table-responsive">
-              <table class="table table-dark table-hover align-middle">
-                <thead>
-                  <tr>
-                    <th>Symbol</th>
-                    <th class="text-end">Qty</th>
-                    <th class="text-end">Avg</th>
-                    <th class="text-end">Price</th>
-                    <th class="text-end">P/L ($)</th>
-                    <th class="text-end">P/L (%)</th>
-                    <th class="text-center">Conf.</th>
-                    <th class="text-end">TP1</th>
-                    <th class="text-end">BE</th>
-                    <th class="text-end">TSL</th>
-                    <th class="text-end">Stop</th>
-                    <th class="text-end">Target</th>
-                  </tr>
-                </thead>
-                <tbody id="positions-tbody">
-                  <tr><td colspan="12" class="text-center text-muted">No open positions</td></tr>
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
+    <!-- APP / NAV BAR -->
+    <header class="appbar">
+      <div class="appbar-left">
+        <span id="mode-dot" class="dot"></span>
+        <span id="mode-text" class="env">LIVE / KRAKEN</span>
       </div>
 
-      <div class="col-md-5">
-        <div class="card bg-secondary h-100">
-          <div class="card-header d-flex justify-content-between align-items-center">
-            <h5 class="mb-0"><i class="fas fa-history me-2"></i>Recent Trades</h5>
-            <span class="pill">Last 10</span>
-          </div>
-          <div class="card-body">
-            <div class="table-responsive">
-              <table class="table table-dark table-hover">
-                <thead>
-                  <tr>
-                    <th>Symbol</th>
-                    <th class="text-end">Entry</th>
-                    <th class="text-end">Exit</th>
-                    <th class="text-end">Qty</th>
-                    <th class="text-end">P&L</th>
-                    <th class="text-center">Result</th>
-                  </tr>
-                </thead>
-                <tbody id="trades-list">
-                  <tr><td colspan="6" class="text-center text-muted">No trades yet</td></tr>
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
+      <!-- BOXIER, BLADE-RUNNER-LIKE WORDMARK (INLINE SVG) -->
+      <div class="appbar-center">
+        <div class="brand-svg" role="img" aria-label="autoPicklr">
+          <!-- The wordmark renders as uppercase geometric shapes for a boxy vibe -->
+          <svg viewBox="0 0 726 56" width="100%" height="56" preserveAspectRatio="xMidYMid meet" class="neon-svg">
+            <defs>
+              <linearGradient id="hotNeon" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0%"  stop-color="#ff5a2b"/>
+                <stop offset="100%" stop-color="#ff9a38"/>
+              </linearGradient>
+            </defs>
+            <g fill="none" stroke="url(#hotNeon)" stroke-width="6" stroke-linecap="square" stroke-linejoin="miter">
 
-    <!-- Activity: Orders/All Trades -->
-    <div class="row mb-5">
-      <div class="col-12">
-        <div class="card bg-secondary">
-          <div class="card-header d-flex justify-content-between align-items-center">
-            <h5 class="mb-0"><i class="fas fa-list me-2"></i>Trading Activity</h5>
-            <div class="btn-group" role="group">
-              <button type="button" class="btn btn-outline-primary btn-sm" onclick="showTab('orders')">Orders</button>
-              <button type="button" class="btn btn-outline-primary btn-sm" onclick="showTab('trades')">All Trades</button>
-            </div>
-          </div>
-          <div class="card-body">
-            <div id="orders-tab" class="activity-tab">
-              <div class="table-responsive">
-                <table class="table table-dark table-hover">
-                  <thead>
-                    <tr>
-                      <th>Time</th>
-                      <th>Symbol</th>
-                      <th>Side</th>
-                      <th class="text-end">Qty</th>
-                      <th class="text-end">Req</th>
-                      <th class="text-end">Fill</th>
-                      <th>Status</th>
-                      <th>Reason</th>
-                    </tr>
-                  </thead>
-                  <tbody id="orders-tbody">
-                    <tr><td colspan="8" class="text-center text-muted">No orders yet</td></tr>
-                  </tbody>
-                </table>
-              </div>
-            </div>
-            <div id="trades-tab" class="activity-tab" style="display:none;">
-              <div class="table-responsive">
-                <table class="table table-dark table-hover">
-                  <thead>
-                    <tr>
-                      <th>Symbol</th>
-                      <th class="text-end">Entry</th>
-                      <th class="text-end">Exit</th>
-                      <th class="text-end">Qty</th>
-                      <th class="text-end">P&L</th>
-                      <th class="text-center">Result</th>
-                    </tr>
-                  </thead>
-                  <tbody id="trades-tbody">
-                    <tr><td colspan="6" class="text-center text-muted">No trades yet</td></tr>
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </div> <!-- card-body -->
+              <!-- Letter width = 60, spacing = 14; height = 48; baseline y=0..48 -->
+              <!-- A -->
+              <g transform="translate(0,4)">
+                <path d="M12,48 L30,0 L48,48"/>
+                <path d="M20,28 H40"/>
+              </g>
+              <!-- U -->
+              <g transform="translate(74,4)">
+                <path d="M12,0 V42 M48,0 V42 M12,42 H48"/>
+              </g>
+              <!-- T -->
+              <g transform="translate(148,4)">
+                <path d="M12,0 H48 M30,0 V48"/>
+              </g>
+              <!-- O -->
+              <g transform="translate(222,4)">
+                <rect x="12" y="0" width="36" height="48" rx="4" ry="4"/>
+              </g>
+              <!-- P -->
+              <g transform="translate(296,4)">
+                <path d="M12,0 V48"/>
+                <path d="M12,0 H42 V24 H12"/>
+              </g>
+              <!-- I -->
+              <g transform="translate(370,4)">
+                <path d="M18,0 H42 M30,0 V48 M18,48 H42"/>
+              </g>
+              <!-- C -->
+              <g transform="translate(444,4)">
+                <path d="M48,0 H12 V48 H48"/>
+              </g>
+              <!-- K -->
+              <g transform="translate(518,4)">
+                <path d="M12,0 V48"/>
+                <path d="M12,24 L48,0 M12,24 L48,48"/>
+              </g>
+              <!-- L -->
+              <g transform="translate(592,4)">
+                <path d="M12,0 V48 M12,48 H48"/>
+              </g>
+              <!-- R -->
+              <g transform="translate(666,4)">
+                <path d="M12,0 V48"/>
+                <path d="M12,0 H42 V24 H12"/>
+                <path d="M24,24 L48,48"/>
+              </g>
+            </g>
+          </svg>
         </div>
       </div>
-    </div>
+
+      <div class="appbar-right">
+        <a class="btn-primary" href="https://pro.kraken.com/app/trade/paxg-usd" target="_blank" rel="noopener" title="Open Kraken Pro">
+          <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" class="ico"><path d="M14 3h7v7M10 14 21 3M21 14v7H3V3h7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          TAKE ME TO KRAKEN
+        </a>
+      </div>
+    </header>
+
+    <!-- MAIN (single column — street) -->
+    <main class="single-col">
+
+      <!-- HEALTH KPIs -->
+      <section class="panel kpis" id="health-kpis">
+        <div class="kpi">
+          <div class="label">Cash</div>
+          <div class="value mono" id="kpi-cash">$0.00</div>
+        </div>
+        <div class="kpi">
+          <div class="label">Win %</div>
+          <div class="value mono" id="kpi-win">—</div>
+        </div>
+        <div class="kpi">
+          <div class="label">CUM Return</div>
+          <div class="value mono" id="kpi-cum">$0.00</div>
+          <div class="sub mono" id="kpi-cum-pct">(0.00%)</div>
+        </div>
+        <div class="kpi">
+          <div class="label">Open Positions (#)</div>
+          <div class="value mono" id="kpi-open">0</div>
+        </div>
+        <div class="kpi">
+          <div class="label">Open Positions (Total $)</div>
+          <div class="value mono" id="kpi-open-total">$0.00</div>
+        </div>
+        <div class="kpi">
+          <div class="label">Today’s PNL</div>
+          <div class="value mono" id="kpi-today">$0.00</div>
+          <div class="sub mono" id="kpi-today-pct">(0.00%)</div>
+        </div>
+        <div class="kpi">
+          <div class="label">Equity</div>
+          <div class="value mono" id="kpi-equity">$0.00</div>
+        </div>
+      </section>
+
+      <!-- POSITIONS -->
+      <section class="panel">
+        <h2>POSITIONS</h2>
+        <div class="table-wrap">
+          <table id="tbl-pos">
+            <thead>
+              <tr>
+                <th>Sym</th>
+                <th class="right">Qty</th>
+                <th class="right">Avg Price</th>
+                <th class="right">Total $</th>
+                <th class="right">Current Price</th>
+                <th class="right">P/L $</th>
+                <th class="right">P/L %</th>
+                <th class="right">Confidence</th>
+                <th class="right">TP1</th>
+                <th>BE</th>
+                <th class="right">Stop</th>
+                <th class="right">Target</th>
+                <th class="right">Time Open (h)</th>
+              </tr>
+            </thead>
+            <tbody id="rows-open"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- TWO-UP: EQUITY CURVE + RECENT SELLS -->
+      <section class="panel grid-2">
+        <div>
+          <h2>Equity Curve</h2>
+          <div class="chart-wrap">
+            <canvas id="equity" width="860" height="260"></canvas>
+            <div class="axis-label x">Days</div>
+            <div class="axis-label y">Equity ($)</div>
+          </div>
+        </div>
+        <div>
+          <h2>RECENT SELLS</h2>
+          <div class="table-wrap small">
+            <table id="tbl-recent">
+              <thead>
+                <tr>
+                  <th>Sym</th>
+                  <th class="right">PNL $</th>
+                  <th class="right">PNL %</th>
+                  <th class="right">Total Sell $</th>
+                  <th>Reason</th>
+                </tr>
+              </thead>
+              <tbody id="rows-recent"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+    </main>
+
+    <footer class="foot">autoPicklr</footer>
+    <script type="module" src="/static/dashboard.js?v=4"></script>
   </div>
-
-  <button class="btn btn-primary refresh-btn rounded-circle" onclick="refreshData()" title="Refresh Data">
-    <i class="fas fa-sync-alt"></i>
-  </button>
-
-  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
-  <script src="/static/app.js?v=4"></script>
 </body>
 </html>
+
