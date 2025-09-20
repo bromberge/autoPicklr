@@ -4,14 +4,14 @@ from sqlmodel import Session
 from models import Wallet
 from sim import place_buy, get_last_price
 
-# brokers.py
-
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
+import os
 import ccxt
 from sqlmodel import Session, select
+
 
 from models import Wallet, Order, Position, Trade, Candle
 from universe import UniversePair
@@ -19,7 +19,8 @@ from settings import (
     BROKER,
     KRAKEN_API_KEY, KRAKEN_API_SECRET,
     LIVE_MAX_ORDER_USD, LIVE_MIN_ORDER_USD,
-    FEE_PCT,   # <— add this
+    FEE_PCT,
+    SLIPPAGE_PCT,  # needed in BUY stop-gap calc
 )
 
 
@@ -54,42 +55,130 @@ class KrakenLiveBroker:
     paper = False
     live = True
 
+    def _split_app_symbol(self, symbol: str) -> tuple[str, str | None]:
+        """
+        Returns (base_app, quote_app_or_None) from whatever the app passed in.
+        Examples:
+          "XDG" -> ("XDG", None)
+          "DOGE/USD" -> ("DOGE", "USD")
+          "sol/usdt" -> ("SOL", "USDT")
+        """
+        s = (symbol or "").strip().upper()
+        if "/" in s:
+            b, q = s.split("/", 1)
+            return b.strip(), q.strip()
+        return s, None
+
+    def _to_exchange_base(self, base_app: str) -> str:
+        """
+        Map app base -> Kraken/CCXT base where symbols differ.
+        XDG -> DOGE, XBT -> BTC, pass-through otherwise.
+        """
+        m = {"XDG": "DOGE", "XBT": "BTC"}
+        return m.get((base_app or "").upper(), (base_app or "").upper())
+
+    def _prefer_quotes_by_wallet(self) -> list[str]:
+        """
+        Prefer the quote you actually have more free balance in (USD vs USDT).
+        Tie-breaker = USD. Fallback = ["USD", "USDT"].
+        """
+        try:
+            bal = self.exch.fetch_balance() or {}
+            free = bal.get("free", {}) or {}
+            usd  = float((free.get("USD")  or free.get("ZUSD")  or 0) or 0)
+            usdt = float((free.get("USDT") or free.get("ZUSDT") or 0) or 0)
+            return ["USD", "USDT"] if usd >= usdt else ["USDT", "USD"]
+        except Exception:
+            return ["USD", "USDT"]
+
+
+    def _pair_min_notional_usd(self, ccxt_symbol: str) -> float:
+        """
+        Return the exchange's min notional (cost) for a given *Kraken* market symbol,
+        e.g. 'AVAX/USD' or 'DOGE/USDT'. Falls back to env if unavailable.
+        """
+        try:
+            markets = getattr(self.exch, "markets", None) or self.exch.load_markets()
+            m = markets.get(ccxt_symbol) or {}
+            lim = (m.get("limits") or {}).get("cost") or {}
+            mn = lim.get("min")
+            if mn is not None:
+                return float(mn)
+        except Exception:
+            pass
+
+        # robust fallback
+        env = (
+            os.environ.get("MIN_TRADE_NOTIONAL_USD")
+            or os.environ.get("MIN_SELL_NOTIONAL_USD")
+            or getattr(self, "min_notional_usd", None)
+        )
+        return float(env or LIVE_MIN_ORDER_USD)
+
+
+
+    def pair_min_notional_usd(self, symbol: str) -> float:
+        """
+        Backwards-compatible shim: accept base or pair and resolve to a real Kraken pair first.
+        """
+        # Resolve to a ccxt symbol using the same logic as orders (no DB session here),
+        # fall back to the wallet-preferred quote.
+        base_app, quote_app = self._split_app_symbol(symbol)
+        base_ex = self._to_exchange_base(base_app)
+        mkts = getattr(self.exch, "markets", {}) or {}
+        if quote_app and f"{base_ex}/{quote_app}" in mkts:
+            ksym = f"{base_ex}/{quote_app}"
+        else:
+            for q in self._prefer_quotes_by_wallet():
+                if f"{base_ex}/{q}" in mkts:
+                    ksym = f"{base_ex}/{q}"
+                    break
+            else:
+                ksym = f"{base_ex}/USDT"
+        return self._pair_min_notional_usd(ksym)
+
+
+
     def __init__(self, engine):
-         self.engine = engine
-         self.exch = ccxt.kraken({
-             "apiKey": KRAKEN_API_KEY,
-             "secret": KRAKEN_API_SECRET,
-             "enableRateLimit": True,
-             # You can add "options": {"adjustForTimeDifference": True}
-         })
+        self.engine = engine
+        self.exch = ccxt.kraken({
+            "apiKey": KRAKEN_API_KEY,
+            "secret": KRAKEN_API_SECRET,
+            "enableRateLimit": True,
+            # "options": {"adjustForTimeDifference": True},
+        })
+        try:
+            self.exch.load_markets()
+        except Exception as e:
+            # Keep going even if load_markets warns (network hiccups, etc.)
+            print(f"[broker] load_markets warning: {e}")
+
 
     def get_balance(self) -> Balance:
-        def _grab(bal, code):
-            return float(
-                (bal.get("free", {}).get(code) or
-                 bal.get("total", {}).get(code) or
-                 bal.get(code, 0.0)) or 0.0
-            )
-
+        """
+        Report live free USD+USDT as cash, and approx equity as cash + MV of DB OPENs
+        (the equity calc stays DB-based for now to avoid heavy per-call valuation).
+        """
         cash = 0.0
         try:
-            b = self.exch.fetch_balance()
-            # cover normalized and legacy kraken codes
-            usd  = _grab(b, "USD")  + _grab(b, "ZUSD")
-            usdt = _grab(b, "USDT") + _grab(b, "ZUSDT")
-            cash = usd + usdt
-        except Exception as e:
-            print(f"[broker] fetch_balance failed: {e}")
+            b = self.exch.fetch_balance() or {}
+            free = b.get("free", {}) or {}
+            cash = float((free.get("USD") or free.get("ZUSD") or 0.0)) + float((free.get("USDT") or free.get("ZUSDT") or 0.0))
+        except Exception:
+            pass
 
         mv = 0.0
         with Session(self.engine) as s:
             opens = s.exec(select(Position).where(Position.status == "OPEN")).all()
             for p in opens:
+                # Use your DB/app symbol; candles align with app symbols
                 c = s.exec(select(Candle).where(Candle.symbol == p.symbol).order_by(Candle.ts.desc())).first()
                 last = float(c.close) if c else float(p.avg_price or 0.0)
                 mv += last * float(p.qty or 0.0)
 
         return Balance(cash_usd=cash, equity_usd=cash + mv)
+
+
 
     def fetch_open_orders(self):
         try:
@@ -112,144 +201,235 @@ class KrakenLiveBroker:
 
 
     def _ccxt_symbol_for(self, session: Session, base: str) -> str:
-        """
-        Prefer the cached universe quote (USD/USDT).
-        CCXT will map BTC/XBT automatically.
-        """
-        row = session.exec(select(UniversePair).where(UniversePair.symbol == base)).first()
-        quote = (row.quote if row and row.quote in ("USDT", "USD") else "USDT")
         base2 = "BTC" if base.upper() in ("XBT", "BTC") else base.upper()
-        return f"{base2}/{quote}"
+
+        # which quote do we actually have cash in?
+        try:
+            bal = self.exch.fetch_balance() or {}
+            free = bal.get("free", {}) or {}
+            usd_free  = float((free.get("USD")  or free.get("ZUSD")  or 0) or 0)
+            usdt_free = float((free.get("USDT") or free.get("ZUSDT") or 0) or 0)
+            pref_quotes = ["USD", "USDT"] if usd_free >= usdt_free else ["USDT", "USD"]
+        except Exception:
+            pref_quotes = ["USD", "USDT"]
+
+        markets = getattr(self.exch, "markets", {}) or {}
+        def _exists(q: str) -> bool:
+            return f"{base2}/{q}" in markets
+
+        for q in pref_quotes:
+            if _exists(q):
+                return f"{base2}/{q}"
+
+        try:
+            row = session.exec(select(UniversePair).where(UniversePair.symbol == base2)).first()
+            if row and row.quote and _exists(row.quote):
+                return f"{base2}/{row.quote}"
+        except Exception:
+            pass
+
+        for q in ("USD", "USDT"):
+            if _exists(q):
+                return f"{base2}/{q}"
+
+        return f"{base2}/USDT"
+
+
 
     def place_order(
         self,
         *,
-        symbol: str,             # base symbol, e.g. "BTC"
+        symbol: str,             # may be "AVAX" or "AVAX/USD"
         side: str,               # "BUY" / "SELL"
         qty: float,
         order_type: str,         # "market" (only for now)
-        price: float,            # your signal entry (for logging / sanity)
+        price: float,            # signal/ref price (for logging)
         reason: str,
+        session: Session,        # reuse main loop session
         score: Optional[float] = None,
-        session: Session,        # IMPORTANT: reuse main loop session
     ):
-        ccxt_symbol = self._ccxt_symbol_for(session, symbol)
+        # ---- Resolve to (db_symbol, ccxt_symbol) ----
+        markets = getattr(self.exch, "markets", None) or self.exch.load_markets()
 
-        # Notional sanity checks (quick guardrails)
-        last = price
-        if not last or last <= 0:
-            c = session.exec(select(Candle).where(Candle.symbol == symbol).order_by(Candle.ts.desc())).first()
-            last = float(c.close) if c else None
-        if not last or last <= 0:
+        def _alias_base(b: str) -> str:
+            b = (b or "").strip().upper()
+            return {"XBT": "BTC", "XDG": "DOGE"}.get(b, b)
+
+        def _alias_quote(q: str) -> str:
+            q = (q or "").strip().upper()
+            return {"ZUSD": "USD", "ZUSDT": "USDT", "USD": "USD", "USDT": "USDT"}.get(q, q)
+
+        sym_raw = (symbol or "").strip().upper()
+        if "/" in sym_raw:
+            base_raw, quote_raw = sym_raw.split("/", 1)
+            base  = _alias_base(base_raw)
+            quote = _alias_quote(quote_raw)
+            ccxt_symbol = f"{base}/{quote}"
+            if ccxt_symbol not in markets:
+                # Fallback: let broker choose best USD/USDT for this base
+                ccxt_symbol = self._ccxt_symbol_for(session, base)
+            db_symbol = base                         # <-- persist base-only in DB
+        else:
+            base = _alias_base(sym_raw)
+            ccxt_symbol = self._ccxt_symbol_for(session, base)
+            db_symbol = base                         # <-- persist base-only in DB
+
+        # ---- Resolve last price for guards ----
+        last = float(price or 0.0)
+        if last <= 0.0:
+            # First try our candle cache by DB symbol (base-only)
+            c = session.exec(
+                select(Candle).where(Candle.symbol == db_symbol).order_by(Candle.ts.desc())
+            ).first()
+            if c:
+                last = float(c.close or 0.0)
+        if last <= 0.0:
+            # Fallback to exchange ticker for the actual market we’ll trade
+            try:
+                t = self.exch.fetch_ticker(ccxt_symbol) or {}
+                last = float(t.get("last") or t.get("close") or 0.0)
+            except Exception:
+                last = 0.0
+
+        if last <= 0.0:
             session.add(Order(
-                ts=datetime.utcnow(), symbol=symbol, side=side, qty=0.0,
-                price_req=price or 0.0, price_fill=0.0,
+                ts=datetime.utcnow(), symbol=db_symbol, side=side, qty=0.0,
+                price_req=float(price or 0.0), price_fill=0.0,
                 status="REJECTED", reason="LIVE: no price"
             ))
-            # Mirror SELL fills into DB position/trade
-            if side.upper() == "SELL":
-                p = session.exec(select(Position).where(Position.symbol == symbol, Position.status == "OPEN")).first()
-                if p:
-                    filled_qty = min(float(filled), float(p.qty or 0.0))
-                    exit_px = float(average or last)
-                    # book trade
-                    pnl = (exit_px - float(p.avg_price or 0.0)) * filled_qty
-                    session.add(Trade(
-                        symbol=symbol,
-                        entry_ts=p.opened_ts,
-                        exit_ts=datetime.utcnow(),
-                        entry_px=float(p.avg_price or 0.0),
-                        exit_px=exit_px,
-                        qty=filled_qty,
-                        pnl_usd=float(pnl),
-                        result=("WIN" if pnl > 0 else "LOSS" if pnl < 0 else "FLAT"),
-                    ))
-                    # reduce/close position
-                    p.qty = max(0.0, float(p.qty or 0.0) - filled_qty)
-                    if p.qty == 0.0:
-                        p.status = "CLOSED"
-
             session.commit()
             return None
 
+        # ---- Min notional / amount floors (use actual Kraken market) ----
         notional_est = qty * last
-        if notional_est < LIVE_MIN_ORDER_USD:
-            session.add(Order(
-                ts=datetime.utcnow(), symbol=symbol, side=side, qty=0.0,
-                price_req=price, price_fill=0.0,
-                status="REJECTED", reason=f"LIVE: below min notional ${LIVE_MIN_ORDER_USD:.2f}"
-            ))
-            session.commit()
-            return None
+        try:
+            pair_min = float(self._pair_min_notional_usd(ccxt_symbol))
+        except Exception:
+            pair_min = float(LIVE_MIN_ORDER_USD)
+
+        if notional_est + 1e-12 < pair_min:
+            if side.upper() == "SELL":
+                pos = session.exec(select(Position).where(
+                    Position.symbol == db_symbol, Position.status == "OPEN"
+                )).first()
+                max_qty = float((pos.qty if pos else 0.0) or 0.0)
+                need_qty = pair_min / max(1e-12, last)
+                new_qty  = min(max_qty, need_qty)
+                if new_qty * last + 1e-12 < pair_min:
+                    session.add(Order(
+                        ts=datetime.utcnow(), symbol=db_symbol, side=side, qty=0.0,
+                        price_req=last, price_fill=0.0,
+                        status="REJECTED",
+                        reason=f"LIVE: position ${max_qty*last:.2f} < pair min ${pair_min:.2f}"
+                    ))
+                    session.commit()
+                    return None
+                qty = float(self.exch.amount_to_precision(ccxt_symbol, new_qty))
+            else:
+                need_qty = pair_min / max(1e-12, last)
+                qty = float(self.exch.amount_to_precision(ccxt_symbol, max(qty, need_qty)))
+
+        # Kraken amount minimum (per-pair)
+        mkt = (getattr(self.exch, "markets", {}) or {}).get(ccxt_symbol, {})
+        try:
+            amt_min = float((((mkt.get("limits") or {}).get("amount") or {}).get("min")) or 0.0)
+        except Exception:
+            amt_min = 0.0
+
+        if amt_min and qty < amt_min:
+            if side.upper() == "SELL":
+                pos = session.exec(select(Position).where(
+                    Position.symbol == db_symbol, Position.status == "OPEN"
+                )).first()
+                max_qty = float((pos.qty if pos else 0.0) or 0.0)
+                qty = min(max_qty, amt_min)
+                if qty <= 0.0:
+                    session.add(Order(
+                        ts=datetime.utcnow(), symbol=db_symbol, side=side, qty=0.0,
+                        price_req=last, price_fill=0.0,
+                        status="REJECTED",
+                        reason=f"LIVE: volume minimum {amt_min} not met"
+                    ))
+                    session.commit()
+                    return None
+            else:
+                qty = amt_min
+
+        # Recompute and clamp to LIVE_MAX_ORDER_USD
+        notional_est = qty * last
         if notional_est > LIVE_MAX_ORDER_USD:
-            # Hard cap to keep first live runs tiny
             qty = LIVE_MAX_ORDER_USD / last
 
-        # Exchange precision
         qty2 = float(self.exch.amount_to_precision(ccxt_symbol, qty))
 
+        # ---- Place the market order ----
         try:
             print(f"[broker] LIVE {side} {ccxt_symbol} qty={qty2} (notional~${qty2*last:.2f})")
             if order_type.lower() != "market":
                 raise ValueError("Only market orders supported in this MVP live path.")
-            if side.upper() == "BUY":
-                od = self.exch.create_market_buy_order(ccxt_symbol, qty2)
-            else:
-                od = self.exch.create_market_sell_order(ccxt_symbol, qty2)
+            od = (
+                self.exch.create_market_buy_order(ccxt_symbol, qty2)
+                if side.upper() == "BUY"
+                else self.exch.create_market_sell_order(ccxt_symbol, qty2)
+            )
         except Exception as e:
             print(f"[broker] create_order failed: {e}")
             session.add(Order(
-                ts=datetime.utcnow(), symbol=symbol, side=side, qty=0.0,
-                price_req=price or last, price_fill=0.0,
+                ts=datetime.utcnow(), symbol=db_symbol, side=side, qty=0.0,
+                price_req=last, price_fill=0.0,
                 status="REJECTED", reason=f"LIVE: {e}"
             ))
             session.commit()
             return None
 
-        # Best-effort fill info (Kraken usually fills markets immediately)
+        # ---- Persist Order (always DB base symbol) ----
         status  = (od.get("status") or "").lower() or "closed"
         filled  = float(od.get("filled") or qty2)
         average = float(od.get("average") or od.get("price") or last)
 
         session.add(Order(
-            ts=datetime.utcnow(), symbol=symbol, side=side, qty=filled,
-            price_req=price or last, price_fill=average,
+            ts=datetime.utcnow(), symbol=db_symbol, side=side, qty=filled,
+            price_req=last, price_fill=average,
             status=("FILLED" if status == "closed" else "PENDING"),
             reason=f"LIVE kraken {reason}"
         ))
 
-        # --- Mirror into our DB (Position/Trade/Wallet) ---
+        # ---- Mirror into DB (Positions/Trades/Wallet) with base-only symbol ----
         if side.upper() == "BUY":
-            # Add/average into an open position
-            p = session.exec(select(Position).where(Position.symbol == symbol, Position.status == "OPEN")).first()
+            p = session.exec(select(Position).where(Position.symbol == db_symbol, Position.status == "OPEN")).first()
             if p:
                 total = p.qty + filled
                 p.avg_price = (p.avg_price * p.qty + average * filled) / total
                 p.qty = total
             else:
+                raw_stop   = (getattr(self, "_last_sig_stop", None)   or average * 0.98)
+                raw_target = (getattr(self, "_last_sig_target", None) or average * 1.05)
+
+                fee_buf  = FEE_PCT * 2.0
+                slip_buf = SLIPPAGE_PCT * 2.0
+                MIN_STOP_GAP_PCT = max(0.006, 3.0 * (fee_buf + slip_buf))
+                min_gap_stop = average * (1.0 - MIN_STOP_GAP_PCT)
+                safe_stop = min(raw_stop, min_gap_stop)
+
                 p = Position(
-                    symbol=symbol,
+                    symbol=db_symbol,       # base-only
                     qty=filled,
                     avg_price=average,
                     opened_ts=datetime.utcnow(),
-                    stop=average * 0.98,     # placeholder; your mgmt will manage these
-                    target=average * 1.05,
+                    stop=safe_stop,
+                    target=raw_target,
                     status="OPEN",
                     score=(float(score) if score is not None else None),
                 )
                 session.add(p)
-
         else:
-            # SELL: close/partial-close an existing position and book a Trade
-            p = session.exec(select(Position).where(Position.symbol == symbol, Position.status == "OPEN")).first()
+            p = session.exec(select(Position).where(Position.symbol == db_symbol, Position.status == "OPEN")).first()
             if p and filled > 0:
                 close_qty = min(p.qty, filled)
-
-                # Book the trade
                 pnl = (average - float(p.avg_price)) * close_qty
                 result = "WIN" if pnl > 0 else "LOSS" if pnl < 0 else "FLAT"
                 session.add(Trade(
-                    symbol=symbol,
+                    symbol=db_symbol,
                     entry_ts=p.opened_ts,
                     exit_ts=datetime.utcnow(),
                     entry_px=float(p.avg_price),
@@ -258,23 +438,19 @@ class KrakenLiveBroker:
                     pnl_usd=float(pnl),
                     result=result,
                 ))
-
-                # Reduce position size / close
                 p.qty = max(0.0, p.qty - close_qty)
                 if p.qty <= 1e-12:
                     p.qty = 0.0
                     p.status = "CLOSED"
 
-                # Credit wallet cash with net proceeds (approx taker fee via FEE_PCT)
                 w = session.get(Wallet, 1)
                 if w:
                     proceeds = average * close_qty * (1 - FEE_PCT)
                     w.balance_usd = float((w.balance_usd or 0.0) + proceeds)
-                    # equity_usd will be refreshed by your periodic balance sync;
-                    # we leave it as-is for now.
 
         session.commit()
         return od
+
 
 
 
@@ -288,59 +464,5 @@ def make_broker(engine):
     else:
         # default to sim if unknown
         return SimBroker(engine)
-
-class KrakenPaperBroker:
-    """
-    Paper broker that uses your existing sim.* functions under the hood.
-    It matches the call made from trading_loop: .place_order(...).
-    """
-    name = "kraken-paper"
-    paper = False
-    live = True
-
-    def __init__(self, engine):
-        self.engine = engine
-
-    def place_order(
-        self,
-        *,
-        symbol: str,
-        side: str,
-        qty: float,
-        order_type: str = "market",
-        price: Optional[float] = None,
-        reason: str = "",
-        score: Optional[float] = None,
-        session: Optional[Session] = None,
-    ):
-        if session is None:
-            # Safety: trading_loop already passes a Session, but keep this fallback.
-            from sqlmodel import Session as _S
-            with _S(self.engine) as s:
-                return self._place_order_impl(s, symbol, side, qty, order_type, price, reason, score)
-        else:
-            return self._place_order_impl(session, symbol, side, qty, order_type, price, reason, score)
-
-    def _place_order_impl(
-        self,
-        s: Session,
-        symbol: str,
-        side: str,
-        qty: float,
-        order_type: str,
-        price: Optional[float],
-        reason: str,
-        score: Optional[float],
-    ):
-        # For paper mode, BUY just delegates to the simulator's place_buy (which books orders/positions/wallet)
-        if side.upper() == "BUY":
-            px = price or (get_last_price(s, symbol) or 0.0)
-            return place_buy(s, symbol, qty, px, reason, score=score)
-
-        # For now we don't route SELLs here; sim.mark_to_market_and_manage()
-        # handles TPs/BE/TSL/Stops internally in paper mode.
-        # You can expand this later for live trading exits.
-        raise NotImplementedError("SELL routing via broker is not used in paper mode yet.")
-
 
 

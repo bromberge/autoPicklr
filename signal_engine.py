@@ -58,6 +58,16 @@ def compute_signals(session: Session, symbol: str) -> List[Signal]:
         else:
             stop   = px * (1.0 - STOP_PCT)
             target = px * (1.0 + TARGET_PCT)
+
+    from settings import FEE_PCT, SLIPPAGE_PCT
+    fee_buf = FEE_PCT * 2.0
+    slip_buf = SLIPPAGE_PCT * 2.0
+    MIN_STOP_GAP_PCT = max(0.006, 3.0 * (fee_buf + slip_buf))
+
+    min_stop = px * (1.0 - MIN_STOP_GAP_PCT)
+    if stop > min_stop:
+        stop = min_stop
+    
     else:
         stop   = px * (1.0 - STOP_PCT)
         target = px * (1.0 + TARGET_PCT)

@@ -11,3 +11,7 @@ sqlmodel
 uvicorn[standard]
 python-dotenv
 ccxt
+numpy
+pandas
+python-dateutil
+xgboost

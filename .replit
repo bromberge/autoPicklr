@@ -1,33 +1,11 @@
 run = "uv pip install -q -r requirements.txt && uv run uvicorn main:app --host 0.0.0.0 --port 8080 --log-level debug"
-modules = ["python-3.11"]
+modules = ["nodejs-20", "python-3.11"]
 
 [nix]
 channel = "stable-25_05"
-
-[[ports]]
-localPort = 5000
-externalPort = 80
+packages = ["glibcLocales"]
 
 [[ports]]
 localPort = 8080
 externalPort = 8080
 
-[workflows]
-runButton = "Project"
-
-[[workflows.workflow]]
-name = "Project"
-mode = "parallel"
-author = "agent"
-
-[[workflows.workflow.tasks]]
-task = "workflow.run"
-args = "main"
-
-[[workflows.workflow]]
-name = "main"
-author = "agent"
-
-[[workflows.workflow.tasks]]
-task = "shell.exec"
-args = "./start_server.sh"

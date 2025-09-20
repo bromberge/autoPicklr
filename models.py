@@ -70,6 +70,7 @@ class Position(SQLModel, table=True):
     tsl_active: bool = False
     tsl_high: Optional[float] = None
     time_in_trade_min: Optional[float] = None
+    custom_tsl_pct: Optional[float] = None  # per-position trailing % (e.g., 0.04 = 4%)
 
 
 class Trade(SQLModel, table=True):
@@ -83,3 +84,30 @@ class Trade(SQLModel, table=True):
     pnl_usd: Optional[float] = None
     result: Optional[str] = None  # WIN/LOSS/FLAT/TIME
     duration_min: Optional[float] = None
+
+# --- Simple daily metrics rollup ---
+from sqlmodel import SQLModel, Field
+from typing import Optional
+from datetime import datetime
+
+class MetricsDaily(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    date_utc: datetime               # midnight UTC for that day
+
+    # account-level snapshot
+    equity_usd: float
+    cash_usd: float
+    exposure_pct: float              # 0..100
+
+    # trades exited on that day
+    trades: int
+    wins: int
+    win_rate: float                  # 0..1
+    avg_win_pct: float               # e.g., 0.054 = +5.4%
+    avg_loss_pct: float              # e.g., -0.021 = -2.1%
+    payoff: float                    # |avg_win| / |avg_loss|, 0 if no losses
+    expectancy: float                # win_rate*avg_win + (1-win_rate)*avg_loss
+
+    # optional cost buckets (populate later if you track exact fees/slippage)
+    fees_usd: float = 0.0
+    slippage_usd: float = 0.0

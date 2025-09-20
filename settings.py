@@ -12,7 +12,8 @@ def env(name, cast=str, default=None):
 WALLET_START_USD   = float(env("WALLET_START_USD", float, 10000))
 UNIVERSE           = [s.strip().upper() for s in env("UNIVERSE", str, "BTC,ETH,SOL").split(",")]
 BASE_CCY           = env("BASE_CCY", str, "USDT")
-POLL_SECONDS       = int(env("POLL_SECONDS", int, 60))
+POLL_SECONDS       = int(env("POLL_SECONDS", int, 30))
+OPEN_POS_UPDATE_SECONDS = int(os.getenv("OPEN_POS_UPDATE_SECONDS", "30"))
 HISTORY_MINUTES    = int(env("HISTORY_MINUTES", int, 600))
 USE_COINGECKO      = env("USE_COINGECKO", str, "true").lower() == "true"
 
@@ -21,13 +22,14 @@ RISK_PCT_PER_TRADE = float(env("RISK_PCT_PER_TRADE", float, 0.02))
 FEE_PCT            = float(env("FEE_PCT", float, 0.0006))      # 0.06% each side
 SLIPPAGE_PCT       = float(env("SLIPPAGE_PCT", float, 0.0008)) # 0.08% each side
 MAX_OPEN_POSITIONS = int(env("MAX_OPEN_POSITIONS", int, 3))
+# Dust threshold: positions with USD value below this are ignored as "open"
+POSITION_DUST_USD = float(env("POSITION_DUST_USD", float, 5.0))
 
-# Caps to keep orders realistic
 MAX_TRADE_COST_PCT     = float(env("MAX_TRADE_COST_PCT", float, 0.50))  # ≤50% equity per trade
 MAX_GROSS_EXPOSURE_PCT = float(env("MAX_GROSS_EXPOSURE_PCT", float, 1.00))  # ≤100% equity total
 MIN_TRADE_NOTIONAL     = float(env("MIN_TRADE_NOTIONAL", float, 10.0))   # e.g., $10 min order
 MIN_TRADE_NOTIONAL_PCT = float(env("MIN_TRADE_NOTIONAL_PCT", float, 0.002))  # e.g., 0.2% of equity
-MIN_BREAKEVEN_EDGE_PCT = float(env("MIN_BREAKEVEN_EDGE_PCT", float, 0.0000)) # extra edge beyond pure breakeven
+MIN_BREAKEVEN_EDGE_PCT = float(env("MIN_BREAKEVEN_EDGE_PCT", float, 0.01000)) # extra edge beyond pure breakeven
 
 # --- Strategy (PicklrMVP defaults) ---
 DET_EMA_SHORT      = int(env("DET_EMA_SHORT", int, 12))
@@ -150,4 +152,13 @@ KRAKEN_API_SECRET = env("KRAKEN_API_SECRET", str, "")
 LIVE_MAX_ORDER_USD = float(env("LIVE_MAX_ORDER_USD", float, 50.0))
 LIVE_MIN_ORDER_USD = float(env("LIVE_MIN_ORDER_USD", float, 5.0))
 
+# ===== Backfill controls =====
+BACKFILL_DAYS_DEFAULT   = int(env("BACKFILL_DAYS_DEFAULT", int, 365))  # default history: how far back in time in days to fetch data
+BACKFILL_CONCURRENCY    = int(env("BACKFILL_CONCURRENCY", int, 6))     # parallel symbols: how many symbols to fetch data for simultaneously, higher is faster but may stress Kraken rate limits (5-6)
+BACKFILL_PAUSE_MS       = int(env("BACKFILL_PAUSE_MS", int, 600))      # sleep between page fetches: A pause between pulling pages to prevent hitting Kraken rate limits (600-700)
+BACKFILL_MAX_PAIRS      = int(env("BACKFILL_MAX_PAIRS", int, 0))       # 0 = no cap; else cap symbol count 
 
+# --- TP1 controls ---
+TP1_PCT = float(os.getenv("TP1_PCT", "0.037"))      # 3.7% default
+TP1_SELL_FRAC = float(os.getenv("TP1_SELL_FRAC", "0.30"))  # sell 30% by default
+MOVE_BE_ON_TP1 = bool(int(os.getenv("MOVE_BE_ON_TP1", "1")))  # move BE after TP1
